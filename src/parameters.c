@@ -19,10 +19,10 @@ static void print_help(const char *program) {
           "think_max >= think_min, eat_max >= eat_min.\n"
           "seed: 0..%d. Единственная стратегия: fifo.\n"
           "Все числа должны помещаться в int (не больше %d).\n"
-          "Размер модели ограничен доступной памятью; "
+          "Размер модели ограничен памятью и доступным числом потоков, "
           "сочетание параметров не должно переполнять время и статистику.\n"
           "time_limit - общий лимит времени, 0 отключает его.\n"
-          "display_delay - реальная пауза между событиями, 0 - без пауз.\n"
+          "display_delay - период снимков состояний, 0 - только события и итоги.\n"
           "По умолчанию: 5 3 500 1500 400 1000 5000 120 42 fifo 60000.\n"
           "Пример: %s 5 3 500 1500 400 1000 5000 0 42 fifo 60000\n",
           program, INT_MAX, INT_MAX, program);
@@ -111,7 +111,7 @@ int read_parameters(int argc, char **argv, Parameters *parameters) {
   SOFT_ASSERT_ERR(meals <= LLONG_MAX / parameters->max_wait);
   if (fl_err != 0) {
     dprintf(STDERR_FILENO, "Ошибка: сочетание параметров может переполнить "
-                           "модельное время или статистику.\n");
+                           "время или статистику.\n");
     return -1;
   }
   return 1;

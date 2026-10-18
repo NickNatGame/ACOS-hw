@@ -12,7 +12,7 @@
 static int fl_err = 0;
 static char binary[PATH_MAX];
 
-/* Оба выражения вычисляем только один раз. long long подходит и для времени. */
+/* Оба выражения вычисляем только один раз. long long подходит и для времени */
 #define SOFT_ASSERT_EQ_ERR(a, b)                                          \
   do                                                                      \
   {                                                                       \
@@ -66,7 +66,7 @@ typedef struct
   long long max_wait;
 } CheckedPhilosopher;
 
-/* Читаем весь файл в динамический массив, оставляя место для '\0'. */
+/* Читаем весь файл в динамический массив, оставляя место для '\0' */
 static char *read_file(const char *name)
 {
   FILE *file = fopen(name, "r");
@@ -100,7 +100,7 @@ static void free_run(TestRun run)
   free(run.errors);
 }
 
-/* Каждый запуск получает отдельный каталог, чтобы не затереть журнал пользователя. */
+/* Каждый запуск получает отдельный каталог, чтобы не затереть журнал пользователя */
 static TestRun run_case(char *const arguments[], int expected_code,
                         int signal_number, int mode)
 {
@@ -171,8 +171,8 @@ static TestRun run_case(char *const arguments[], int expected_code,
   SOFT_ASSERT_ERR(child >= 0);
   if (child == 0)
   {
-    /* Если проверяемая программа зависнет, тест завершит её через 5 секунд. */
-    alarm(5);
+    /* Если проверяемая программа зависнет, тест завершит её через 20 секунд */
+    alarm(20);
     if (chdir(directory) != 0)
     {
       _exit(125);
@@ -196,14 +196,17 @@ static TestRun run_case(char *const arguments[], int expected_code,
       close(channel[0]);
       close(channel[1]);
     }
+
+    /* Сюда попадаем, только если execv не смог запустить программу */
     execv(binary, command);
-    _exit(125); /* Сюда попадаем, только если execv не смог запустить программу. */
+    _exit(125);
   }
   free(command);
   if (mode == CLOSED_OUTPUT)
   {
+    /* У канала не осталось читателей */
     close(channel[0]);
-    close(channel[1]); /* У канала не осталось читателей. */
+    close(channel[1]);
   }
 
   if (child > 0)
@@ -216,7 +219,9 @@ static TestRun run_case(char *const arguments[], int expected_code,
       for (int i = 0; i < 300 && !ready; i++)
       {
         char *log = read_file(log_path);
-        ready = log != NULL && strstr(log, "начал есть") != NULL;
+        const char *event = strcmp(arguments[2], "2147483647") == 0
+                                ? "начал размышление" : "начал есть";
+        ready = log != NULL && strstr(log, event) != NULL;
         free(log);
         if (!ready)
         {
@@ -224,6 +229,27 @@ static TestRun run_case(char *const arguments[], int expected_code,
         }
       }
       SOFT_ASSERT_ERR(ready);
+      if (ready)
+      {
+        char status_path[64];
+        snprintf(status_path, sizeof(status_path), "/proc/%ld/status", (long)child);
+        FILE *status_file = fopen(status_path, "r");
+        SOFT_ASSERT_ERR(status_file != NULL);
+        int threads = 0;
+        if (status_file != NULL)
+        {
+          char line[256];
+          while (fgets(line, sizeof(line), status_file) != NULL)
+          {
+            if (sscanf(line, "Threads: %d", &threads) == 1)
+            {
+              break;
+            }
+          }
+          fclose(status_file);
+        }
+        SOFT_ASSERT_EQ_ERR(threads, atoi(arguments[0]) + 1);
+      }
       SOFT_ASSERT_ERR(kill(child, ready ? signal_number : SIGKILL) == 0);
     }
     int status = 0;
@@ -250,8 +276,9 @@ static TestRun run_case(char *const arguments[], int expected_code,
       {
         if (mode == CLOSED_OUTPUT)
         {
+          /* После ошибки stdout проверяем события по журналу */
           free(run.output);
-          run.output = log; /* После ошибки stdout проверяем события по журналу. */
+          run.output = log;
         }
         else
         {
@@ -292,7 +319,7 @@ static int check_trace(const char *output, int count, int cycles, int complete)
   long long final_time;
   const char *ranges = strstr(output, "Размышление:");
   const char *limit = strstr(output, "Лимит ожидания:");
-  const char *time = strstr(output, "Модельное время:");
+  const char *time = strstr(output, "Время работы:");
   SOFT_ASSERT_ERR(ranges != NULL && limit != NULL && time != NULL);
   if (ranges == NULL || limit == NULL || time == NULL)
   {
@@ -301,7 +328,7 @@ static int check_trace(const char *output, int count, int cycles, int complete)
   int fields = sscanf(ranges, "Размышление: %d..%d ms, еда: %d..%d ms",
                       &think_min, &think_max, &eat_min, &eat_max);
   int limit_fields = sscanf(limit, "Лимит ожидания: %d ms", &wait_limit);
-  int time_fields = sscanf(time, "Модельное время: %lld ms", &final_time);
+  int time_fields = sscanf(time, "Время работы: %lld ms", &final_time);
   SOFT_ASSERT_ERR(fields == 4 && limit_fields == 1 && time_fields == 1);
   if (fields != 4 || limit_fields != 1 || time_fields != 1)
   {
@@ -369,7 +396,7 @@ static int check_trace(const char *output, int count, int cycles, int complete)
       else if (strncmp(text, "закончил размышление", strlen("закончил размышление")) == 0)
       {
         SOFT_ASSERT_EQ_ERR(philosopher->state, THINKING);
-        SOFT_ASSERT_EQ_ERR(now, philosopher->deadline);
+        SOFT_ASSERT_ERR(now >= philosopher->deadline);
         for (int i = 0; i < queue_size; i++)
         {
           SOFT_ASSERT_ERR(queue[i] != id);
@@ -449,7 +476,7 @@ static int check_trace(const char *output, int count, int cycles, int complete)
       else if (strcmp(text, "закончил есть") == 0)
       {
         SOFT_ASSERT_EQ_ERR(philosopher->state, EATING);
-        SOFT_ASSERT_EQ_ERR(now, philosopher->deadline);
+        SOFT_ASSERT_ERR(now >= philosopher->deadline);
         philosopher->cycles_done++;
         philosopher->state = FINISHED;
         eaters--;
@@ -598,25 +625,25 @@ static void test_help(void)
   }
 }
 
-static void test_exact_durations(void)
+static void test_fixed_durations(void)
 {
-  char *arguments[] = {"2", "1", "3", "3", "7", "7", "7", "0", "42", NULL};
+  char *arguments[] = {"2", "1", "3", "3", "7", "7", "100", "0", "42", NULL};
   TestRun run = run_model(arguments, 0);
-  check_contains(run.output, "Модельное время: 17 ms");
+  check_contains(run.output, "Всего завершённых приёмов пищи: 2");
   free_run(run);
 }
 
 static void test_zero_thinking(void)
 {
-  char *arguments[] = {"2", "2", "0", "0", "7", "7", "7", "0", "42", NULL};
+  char *arguments[] = {"2", "2", "0", "0", "7", "7", "100", "0", "42", NULL};
   TestRun run = run_model(arguments, 0);
-  check_contains(run.output, "[     0 ms] Философ 1: начал есть");
+  check_contains(run.output, "начал размышление на 0 ms");
   free_run(run);
 }
 
-static void test_wait_boundary(void)
+static void test_serial_forks(void)
 {
-  char *arguments[] = {"2", "1", "0", "0", "200", "200", "200", "0", "42", NULL};
+  char *arguments[] = {"2", "1", "0", "0", "20", "20", "1000", "0", "42", NULL};
   free_run(run_model(arguments, 0));
 }
 
@@ -624,8 +651,8 @@ static void test_wait_timeout(void)
 {
   char *arguments[] = {"2", "1", "0", "0", "200", "200", "150", "0", "42", NULL};
   TestRun run = run_model(arguments, 2);
-  check_contains(run.output, "философ 2 ждёт 151 ms");
-  SOFT_ASSERT_ERR(run.output != NULL && strstr(run.output, "Философ 2: получил") == NULL);
+  check_contains(run.output, "превышено максимально допустимое ожидание");
+  check_contains(run.output, "Всего завершённых приёмов пищи: 0");
   free_run(run);
 }
 
@@ -634,15 +661,18 @@ static void test_global_timeout(void)
   char *arguments[] = {"2", "1", "0", "0", "200", "200", "1000", "0", "42", "fifo", "50", NULL};
   TestRun run = run_model(arguments, 2);
   check_contains(run.output, "достигнут общий лимит");
-  check_contains(run.output, "Модельное время: 50 ms");
+  long long elapsed = 0;
+  const char *time = strstr(run.output, "Время работы:");
+  SOFT_ASSERT_ERR(time != NULL && sscanf(time, "Время работы: %lld", &elapsed) == 1);
+  SOFT_ASSERT_ERR(elapsed >= 50);
   free_run(run);
 }
 
-static void test_completion_boundary(void)
+static void test_completion_before_limit(void)
 {
-  char *arguments[] = {"2", "1", "0", "0", "7", "7", "7", "0", "42", "fifo", "14", NULL};
+  char *arguments[] = {"2", "1", "0", "0", "7", "7", "1000", "0", "42", "fifo", "1000", NULL};
   TestRun run = run_model(arguments, 0);
-  check_contains(run.output, "Модельное время: 14 ms");
+  check_contains(run.output, "все философы выполнили");
   free_run(run);
 }
 
@@ -652,18 +682,20 @@ static void test_many_philosophers(void)
   free_run(run_model(arguments, 0));
 }
 
+/* Большие длительности проверяем с коротким лимитом */
 static void test_long_times(void)
 {
-  char *arguments[] = {"2", "1", "2147483647", "2147483647", "1", "1", "1", "0", "42", "fifo", "0", NULL};
-  TestRun run = run_model(arguments, 0);
-  check_contains(run.output, "Модельное время: 2147483649 ms");
+  char *arguments[] = {"2", "1", "2147483647", "2147483647", "1", "1", "1000", "0", "42", "fifo", "50", NULL};
+  TestRun run = run_model(arguments, 2);
+  check_contains(run.output, "начал размышление на 2147483647 ms");
+  check_contains(run.output, "достигнут общий лимит");
   free_run(run);
 }
 
 static void test_wide_time_range(void)
 {
-  char *arguments[] = {"2", "1", "0", "2147483647", "1", "1", "2147483647", "0", "42", "fifo", "0", NULL};
-  free_run(run_model(arguments, 0));
+  char *arguments[] = {"2", "1", "0", "2147483647", "1", "1", "2147483647", "0", "42", "fifo", "50", NULL};
+  free_run(run_model(arguments, 2));
 }
 
 static void test_large_cycle_count(void)
@@ -681,13 +713,11 @@ static void test_statistics_overflow(void)
   free_run(run);
 }
 
-static void test_reproducible(void)
+static void test_repeated_runs(void)
 {
   char *arguments[] = {"7", "3", "0", "30", "1", "20", "10000", "0", "123", NULL};
   TestRun first = run_model(arguments, 0);
   TestRun second = run_model(arguments, 0);
-  SOFT_ASSERT_ERR(first.output != NULL && second.output != NULL &&
-                  strcmp(first.output, second.output) == 0);
   free_run(first);
   free_run(second);
 }
@@ -750,9 +780,18 @@ static void test_signals(void)
     TestRun run = run_case(arguments, 128 + signals[i], signals[i], NORMAL);
     check_trace(run.output, 2, 100, 0);
     check_contains(run.output, "прерывание пользователем");
-    check_contains(run.output, "Модельное время: 0 ms");
     free_run(run);
   }
+}
+
+static void test_signal_while_thinking(void)
+{
+  char *arguments[] = {"2", "1", "2147483647", "2147483647", "1", "1", "1000", "0", "42", "fifo", "0", NULL};
+  TestRun run = run_case(arguments, 130, SIGINT, NORMAL);
+  check_trace(run.output, 2, 1, 0);
+  check_contains(run.output, "прерывание пользователем");
+  check_contains(run.output, "Всего завершённых приёмов пищи: 0");
+  free_run(run);
 }
 
 static void test_soft_assert_diagnostics(void)
@@ -838,22 +877,23 @@ int main(int argc, char **argv)
 
   test_defaults();
   test_help();
-  test_exact_durations();
+  test_fixed_durations();
   test_zero_thinking();
-  test_wait_boundary();
+  test_serial_forks();
   test_wait_timeout();
   test_global_timeout();
-  test_completion_boundary();
+  test_completion_before_limit();
   test_many_philosophers();
   test_long_times();
   test_wide_time_range();
   test_large_cycle_count();
   test_statistics_overflow();
-  test_reproducible();
+  test_repeated_runs();
   test_non_neighbours();
   test_various_inputs();
   test_invalid_inputs();
   test_signals();
+  test_signal_while_thinking();
   test_soft_assert_diagnostics();
   test_log_open_error();
   test_log_write_error();
@@ -861,7 +901,7 @@ int main(int argc, char **argv)
 
   if (fl_err == 0)
   {
-    puts("OK: all 22 tests passed");
+    puts("OK: all 23 tests passed");
     return 0;
   }
   fprintf(stderr, "FAILED: %d checks\n", fl_err);

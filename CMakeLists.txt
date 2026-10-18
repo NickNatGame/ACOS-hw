@@ -6,6 +6,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(Threads REQUIRED)
+
 add_executable(philosophers
     src/philosophers.c
     src/parameters.c
@@ -13,6 +15,7 @@ add_executable(philosophers
     src/console.c
 )
 
+target_link_libraries(philosophers PRIVATE Threads::Threads)
 target_include_directories(philosophers PRIVATE inc)
 target_compile_definitions(philosophers PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_options(philosophers PRIVATE -Wall -Wextra -Wpedantic)
@@ -33,5 +36,5 @@ if(BUILD_TESTING)
     add_test(NAME philosophers_tests
         COMMAND philosophers_tests $<TARGET_FILE:philosophers>
     )
-    set_tests_properties(philosophers_tests PROPERTIES TIMEOUT 60)
+    set_tests_properties(philosophers_tests PROPERTIES TIMEOUT 90)
 endif()

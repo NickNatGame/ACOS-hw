@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -12,8 +13,10 @@
 
 static int log_fd = -1;       /* тут будет файл для логирования */
 static int write_error = 0;
-static volatile sig_atomic_t stop_signal = 0;     /* тут будет указано, если программа завершилась неожиданно,  */ 
-                                                  /* к примеру SIGINT или SIGTERM                               */         
+
+/* для безопасной передачи сигнала */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal flag must be lock-free");
+static atomic_int stop_signal = 0;
 
 /* Обработчик только запоминает сигнал. Итоги печатает основная программа */
 static void handle_signal(int number) { stop_signal = number; }

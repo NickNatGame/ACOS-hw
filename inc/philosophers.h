@@ -1,6 +1,9 @@
 #ifndef PHILOSOPHERS_H
 #define PHILOSOPHERS_H
 
+/* Ограничиваем число участников до создания процессов и общей памяти */
+#define MAX_PHILOSOPHERS 256
+
 typedef struct {
     int count;
     int cycles;

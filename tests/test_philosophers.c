@@ -1,3 +1,4 @@
+#include "philosophers.h"
 #include "soft_assert.h"
 
 #include <fcntl.h>
@@ -11,6 +12,8 @@
 
 static int fl_err = 0;
 static char binary[PATH_MAX];
+static char fault_binary[PATH_MAX];
+static const char *failure = NULL;
 
 /* Оба выражения вычисляем только один раз. long long подходит и для времени */
 #define SOFT_ASSERT_EQ_ERR(a, b)                                          \
@@ -31,7 +34,9 @@ enum
   NORMAL,
   LOG_DIRECTORY,
   LOG_FULL,
-  CLOSED_OUTPUT
+  CLOSED_OUTPUT,
+  CHILD_SIGNAL,
+  GROUP_SIGNAL
 };
 
 typedef struct
@@ -98,6 +103,31 @@ static void free_run(TestRun run)
 {
   free(run.output);
   free(run.errors);
+}
+
+static int read_children(pid_t parent, pid_t children[])
+{
+  char path[96];
+  snprintf(path, sizeof(path), "/proc/%ld/task/%ld/children", (long)parent,
+            (long)parent);
+  FILE *file = fopen(path, "r");
+  SOFT_ASSERT_ERR(file != NULL);
+  if (file == NULL)
+  {
+    return 0;
+  }
+  int count = 0;
+  long pid;
+  while (fscanf(file, "%ld", &pid) == 1)
+  {
+    SOFT_ASSERT_ERR(count < MAX_PHILOSOPHERS);
+    if (count < MAX_PHILOSOPHERS)
+    {
+      children[count++] = (pid_t)pid;
+    }
+  }
+  SOFT_ASSERT_ERR(fclose(file) == 0);
+  return count;
 }
 
 /* Каждый запуск получает отдельный каталог, чтобы не затереть журнал пользователя */
@@ -173,6 +203,11 @@ static TestRun run_case(char *const arguments[], int expected_code,
   {
     /* Если проверяемая программа зависнет, тест завершит её через 20 секунд */
     alarm(20);
+    if (setpgid(0, 0) == -1 ||
+        (failure != NULL && setenv("PHILOSOPHERS_TEST_FAILURE", failure, 1) == -1))
+    {
+      _exit(125);
+    }
     if (chdir(directory) != 0)
     {
       _exit(125);
@@ -229,8 +264,20 @@ static TestRun run_case(char *const arguments[], int expected_code,
         }
       }
       SOFT_ASSERT_ERR(ready);
+      pid_t target = child;
       if (ready)
       {
+        pid_t children[MAX_PHILOSOPHERS];
+        int count = read_children(child, children);
+        SOFT_ASSERT_EQ_ERR(count, atoi(arguments[0]));
+        if (mode == CHILD_SIGNAL && count > 0)
+        {
+          target = children[0];
+        }
+        else if (mode == GROUP_SIGNAL)
+        {
+          target = -child;
+        }
         char status_path[64];
         snprintf(status_path, sizeof(status_path), "/proc/%ld/status", (long)child);
         FILE *status_file = fopen(status_path, "r");
@@ -248,9 +295,10 @@ static TestRun run_case(char *const arguments[], int expected_code,
           }
           fclose(status_file);
         }
-        SOFT_ASSERT_EQ_ERR(threads, atoi(arguments[0]) + 1);
+        SOFT_ASSERT_EQ_ERR(threads, 1);
       }
-      SOFT_ASSERT_ERR(kill(child, ready ? signal_number : SIGKILL) == 0);
+      SOFT_ASSERT_ERR(kill(ready ? target : -child,
+                           ready ? signal_number : SIGKILL) == 0);
     }
     int status = 0;
     pid_t waited;
@@ -268,7 +316,7 @@ static TestRun run_case(char *const arguments[], int expected_code,
     run.errors = read_file(errors_path);
     SOFT_ASSERT_ERR(run.output != NULL && run.errors != NULL);
     run.log_exists = access(log_path, F_OK) == 0;
-    if (run.log_exists && (mode == NORMAL || mode == CLOSED_OUTPUT))
+    if (run.log_exists && mode != LOG_DIRECTORY && mode != LOG_FULL)
     {
       char *log = read_file(log_path);
       SOFT_ASSERT_ERR(log != NULL);
@@ -290,6 +338,24 @@ static TestRun run_case(char *const arguments[], int expected_code,
       {
         free(log);
       }
+    }
+    char shared_path[96];
+    snprintf(shared_path, sizeof(shared_path), "/dev/shm/philosophers-%ld",
+              (long)child);
+    SOFT_ASSERT_ERR(access(shared_path, F_OK) == -1 && errno == ENOENT);
+    /* Родитель обязан дождаться каждого PID, который сообщил при запуске */
+    const char *line = run.output;
+    while (line != NULL && (line = strstr(line, "Процесс философа ")) != NULL)
+    {
+      int id;
+      long pid;
+      int fields = sscanf(line, "Процесс философа %d: PID %ld", &id, &pid);
+      SOFT_ASSERT_EQ_ERR(fields, 2);
+      if (fields == 2)
+      {
+        SOFT_ASSERT_ERR(kill((pid_t)pid, 0) == -1 && errno == ESRCH);
+      }
+      line++;
     }
   }
 
@@ -603,7 +669,22 @@ static TestRun run_model(char *const arguments[], int code)
 
 static void check_contains(const char *text, const char *part)
 {
-  SOFT_ASSERT_ERR(text != NULL && strstr(text, part) != NULL);
+  int found = text != NULL && strstr(text, part) != NULL;
+  SOFT_ASSERT_ERR(found);
+  if (!found)
+  {
+    fprintf(stderr, "Не найдено в выводе: %s\n", part);
+  }
+}
+
+static void check_invalid_arguments(char *const arguments[], const char *message)
+{
+  TestRun run = run_case(arguments, 1, 0, NORMAL);
+  check_contains(run.errors, "Ошибка:");
+  check_contains(run.errors, message);
+  SOFT_ASSERT_ERR(run.output != NULL && run.output[0] == '\0');
+  SOFT_ASSERT_ERR(!run.log_exists);
+  free_run(run);
 }
 
 static void test_defaults(void)
@@ -623,6 +704,65 @@ static void test_help(void)
     SOFT_ASSERT_ERR(!run.log_exists);
     free_run(run);
   }
+}
+
+/* Проверяем каждый допустимый конец команды без запуска долгой модели */
+static void test_partial_arguments(void)
+{
+  char *arguments[] = {"philosophers", "2", "1", "0", "0", "1", "1",
+                       "2000", "0", "123", "fifo", "0", NULL};
+  for (int count = 1; count <= 12; count++)
+  {
+    char *next = arguments[count];
+    arguments[count] = NULL;
+    Parameters parameters = {0};
+    SOFT_ASSERT_EQ_ERR(read_parameters(count, arguments, &parameters), 1);
+    arguments[count] = next;
+
+    SOFT_ASSERT_EQ_ERR(parameters.count, count > 1 ? 2 : 5);
+    SOFT_ASSERT_EQ_ERR(parameters.cycles, count > 2 ? 1 : 3);
+    SOFT_ASSERT_EQ_ERR(parameters.think_min, count > 3 ? 0 : 500);
+    SOFT_ASSERT_EQ_ERR(parameters.think_max, count > 4 ? 0 : 1500);
+    SOFT_ASSERT_EQ_ERR(parameters.eat_min, count > 5 ? 1 : 400);
+    SOFT_ASSERT_EQ_ERR(parameters.eat_max, count > 6 ? 1 : 1000);
+    SOFT_ASSERT_EQ_ERR(parameters.max_wait, count > 7 ? 2000 : 5000);
+    SOFT_ASSERT_EQ_ERR(parameters.display_delay, count > 8 ? 0 : 120);
+    SOFT_ASSERT_EQ_ERR(parameters.seed, count > 9 ? 123 : 42);
+    SOFT_ASSERT_EQ_ERR(parameters.time_limit, count > 11 ? 0 : 60000);
+  }
+}
+
+static void test_parameter_boundaries(void)
+{
+  char maximum_count[16], maximum_number[16];
+  snprintf(maximum_count, sizeof(maximum_count), "%d", MAX_PHILOSOPHERS);
+  snprintf(maximum_number, sizeof(maximum_number), "%d", INT_MAX);
+  char *arguments[] = {"philosophers", maximum_count, "1", "0", maximum_number,
+                       "1", maximum_number, maximum_number, maximum_number,
+                       maximum_number, "fifo", maximum_number, NULL};
+  Parameters parameters = {0};
+  SOFT_ASSERT_EQ_ERR(read_parameters(12, arguments, &parameters), 1);
+  SOFT_ASSERT_EQ_ERR(parameters.count, MAX_PHILOSOPHERS);
+  SOFT_ASSERT_EQ_ERR(parameters.cycles, 1);
+  SOFT_ASSERT_EQ_ERR(parameters.think_min, 0);
+  SOFT_ASSERT_EQ_ERR(parameters.think_max, INT_MAX);
+  SOFT_ASSERT_EQ_ERR(parameters.eat_min, 1);
+  SOFT_ASSERT_EQ_ERR(parameters.eat_max, INT_MAX);
+  SOFT_ASSERT_EQ_ERR(parameters.max_wait, INT_MAX);
+  SOFT_ASSERT_EQ_ERR(parameters.display_delay, INT_MAX);
+  SOFT_ASSERT_EQ_ERR(parameters.seed, INT_MAX);
+  SOFT_ASSERT_EQ_ERR(parameters.time_limit, INT_MAX);
+}
+
+static void test_leading_zeroes(void)
+{
+  char *arguments[] = {"002", "01", "00", "00", "001", "01", "01000",
+                       "00", "000", "fifo", "00", NULL};
+  TestRun run = run_model(arguments, 0);
+  check_contains(run.output, "Период показа: 0 ms, seed: 0.");
+  check_contains(run.output, "общий лимит: 0 ms");
+  SOFT_ASSERT_ERR(run.errors != NULL && run.errors[0] == '\0');
+  free_run(run);
 }
 
 static void test_fixed_durations(void)
@@ -724,7 +864,7 @@ static void test_repeated_runs(void)
 
 static void test_non_neighbours(void)
 {
-  char *arguments[] = {"5", "3", "0", "30", "20", "20", "1000", "0", "42", NULL};
+  char *arguments[] = {"5", "3", "0", "30", "50", "50", "1000", "0", "5", NULL};
   TestRun run = run_case(arguments, 0, 0, NORMAL);
   SOFT_ASSERT_ERR(check_trace(run.output, 5, 3, 1) >= 2);
   free_run(run);
@@ -744,31 +884,68 @@ static void test_various_inputs(void)
   }
 }
 
+static void test_invalid_numbers(void)
+{
+  char *bad_numbers[] = {"abc", "", " ", "\t", "\n", " 2", "\t2", "\n2",
+                         "2 ", "2\t", "2\n", "2 0", "2x", "2.0", "2,0",
+                         "1e2", "0x10", "+2", "-2", "+0", "-0", "+", "-",
+                         "--help", "NaN", "inf", "2147483648", "4294967298",
+                         "999999999999999999999999999"};
+  const char *names[] = {"N", "cycles", "think_min", "think_max", "eat_min",
+                         "eat_max", "max_wait", "display_delay", "seed",
+                         "strategy", "time_limit"};
+  for (int index = 0; index < 11; index++)
+  {
+    if (index == 9)
+    {
+      continue;
+    }
+    for (size_t i = 0; i < sizeof(bad_numbers) / sizeof(bad_numbers[0]); i++)
+    {
+      char *arguments[] = {"2", "1", "0", "0", "1", "1", "1000", "0",
+                           "42", "fifo", "1000", NULL};
+      arguments[index] = bad_numbers[i];
+      check_invalid_arguments(arguments, names[index]);
+    }
+  }
+}
+
+static void test_philosopher_limit(void)
+{
+  char above_limit[16];
+  snprintf(above_limit, sizeof(above_limit), "%d", MAX_PHILOSOPHERS + 1);
+  char *counts[] = {above_limit, "100000", "2147483647"};
+  for (int i = 0; i < 3; i++)
+  {
+    char *arguments[] = {counts[i], NULL};
+    check_invalid_arguments(arguments, "N должно быть от 2 до");
+  }
+}
+
 static void test_invalid_inputs(void)
 {
-  char *bad_numbers[] = {"abc", "", "2x", "999999999999999999999999999"};
-  for (int i = 0; i < 4; i++)
-  {
-    char *arguments[] = {bad_numbers[i], NULL};
-    free_run(run_case(arguments, 1, 0, NORMAL));
-  }
-  int indexes[] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 6, 7, 7, 8, 8};
+  int indexes[] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6, 7, 7, 8, 8};
   char *values[] = {"0", "1", "2147483648", "4294967298", "0", "2147483648",
-                    "-1", "1", "4294967295", "0", "2", "0", "-1", "2147483648", "-1", "2147483648"};
-  for (int i = 0; i < 16; i++)
+                    "-1", "1", "4294967295", "0", "2", "0", "0", "-1", "2147483648", "-1", "2147483648"};
+  for (int i = 0; i < 17; i++)
   {
     char *arguments[] = {"2", "1", "0", "0", "1", "1", "1000", "0", "42", NULL};
     arguments[indexes[i]] = values[i];
-    free_run(run_case(arguments, 1, 0, NORMAL));
+    check_invalid_arguments(arguments, "FAIL ");
   }
-  char *bad_strategy[] = {"2", "1", "0", "0", "1", "1", "1000", "0", "42", "unknown", NULL};
+  char *strategies[] = {"unknown", "", "FIFO", " fifo", "fifo ", "--help"};
+  for (int i = 0; i < 6; i++)
+  {
+    char *arguments[] = {"2", "1", "0", "0", "1", "1", "1000", "0",
+                         "42", strategies[i], NULL};
+    check_invalid_arguments(arguments, "поддерживается только стратегия fifo");
+  }
   char *negative_limit[] = {"2", "1", "0", "0", "1", "1", "1000", "0", "42", "fifo", "-1", NULL};
   char *large_limit[] = {"2", "1", "0", "0", "1", "1", "1000", "0", "42", "fifo", "2147483648", NULL};
   char *extra_argument[] = {"2", "1", "0", "0", "1", "1", "1000", "0", "42", "fifo", "10", "1", NULL};
-  free_run(run_case(bad_strategy, 1, 0, NORMAL));
-  free_run(run_case(negative_limit, 1, 0, NORMAL));
-  free_run(run_case(large_limit, 1, 0, NORMAL));
-  free_run(run_case(extra_argument, 1, 0, NORMAL));
+  check_invalid_arguments(negative_limit, "time_limit");
+  check_invalid_arguments(large_limit, "time_limit");
+  check_invalid_arguments(extra_argument, "слишком много аргументов");
 }
 
 static void test_signals(void)
@@ -792,6 +969,62 @@ static void test_signal_while_thinking(void)
   check_contains(run.output, "прерывание пользователем");
   check_contains(run.output, "Всего завершённых приёмов пищи: 0");
   free_run(run);
+}
+
+static void test_child_failures(void)
+{
+  int signals[] = {SIGKILL, SIGSTOP};
+  for (int i = 0; i < 2; i++)
+  {
+    char *arguments[] = {"2", "100", "0", "0", "200", "200", "1000",
+                         "0", "42", "fifo", "0", NULL};
+    TestRun run = run_case(arguments, 1, signals[i], CHILD_SIGNAL);
+    check_contains(run.errors, "аварийно завершился или был остановлен");
+    check_contains(run.output, "аварийное завершение дочернего процесса");
+    check_contains(run.output, "Вилки: F1=свободна F2=свободна");
+    free_run(run);
+  }
+}
+
+static void test_group_signals(void)
+{
+  int signals[] = {SIGINT, SIGTERM};
+  for (int i = 0; i < 2; i++)
+  {
+    char *arguments[] = {"2", "100", "0", "0", "200", "200", "1000",
+                         "0", "42", "fifo", "0", NULL};
+    TestRun run = run_case(arguments, 128 + signals[i], signals[i], GROUP_SIGNAL);
+    check_contains(run.output, "прерывание пользователем");
+    check_trace(run.output, 2, 100, 0);
+    free_run(run);
+  }
+}
+
+static void test_resource_failures(void)
+{
+  char original[PATH_MAX];
+  strcpy(original, binary);
+  strcpy(binary, fault_binary);
+  const char *failures[] = {"shm_open", "space", "mmap", "mutex", "semaphore",
+                            "fork", "clock", "sem_wait", "sem_post",
+                            "lock_death", "lock_stop", "startup_signal"};
+  const char *messages[] = {"Ошибка shm_open", "Ошибка posix_fallocate", "Ошибка mmap",
+                            "Ошибка sem_init", "Ошибка sem_init", "Ошибка fork",
+                            "ошибка clock_gettime", "аварийное завершение дочернего процесса",
+                            "ошибка sem_post", "аварийное завершение дочернего процесса",
+                            "аварийное завершение дочернего процесса", "прерывание пользователем"};
+  for (int i = 0; i < 12; i++)
+  {
+    failure = failures[i];
+    char *arguments[] = {"5", "1", "0", "0", "10", "10", "1000", "0",
+                         "42", "fifo", "2000", NULL};
+    TestRun run = run_case(arguments, i == 11 ? 130 : 1, 0, NORMAL);
+    check_contains(run.output, messages[i]);
+    SOFT_ASSERT_ERR(run.log_exists);
+    free_run(run);
+  }
+  failure = NULL;
+  strcpy(binary, original);
 }
 
 static void test_soft_assert_diagnostics(void)
@@ -848,35 +1081,42 @@ static void test_closed_output(void)
 
 int main(int argc, char **argv)
 {
-  if (argc != 2)
+  if (argc < 2 || argc > 3)
   {
-    fprintf(stderr, "Использование: %s путь_к_программе\n", argv[0]);
+    fprintf(stderr, "Использование: %s путь_к_программе [путь_к_программе_с_подменами]\n", argv[0]);
     return 1;
   }
-  int length;
-  if (argv[1][0] == '/')
+  for (int i = 1; i < argc; i++)
   {
-    length = snprintf(binary, sizeof(binary), "%s", argv[1]);
-  }
-  else
-  {
-    char directory[PATH_MAX];
-    SOFT_ASSERT_ERR(getcwd(directory, sizeof(directory)) != NULL);
+    char *path = i == 1 ? binary : fault_binary;
+    int length;
+    if (argv[i][0] == '/')
+    {
+      length = snprintf(path, PATH_MAX, "%s", argv[i]);
+    }
+    else
+    {
+      char directory[PATH_MAX];
+      SOFT_ASSERT_ERR(getcwd(directory, sizeof(directory)) != NULL);
+      if (fl_err != 0)
+      {
+        return 1;
+      }
+      length = snprintf(path, PATH_MAX, "%s/%s", directory, argv[i]);
+    }
+    SOFT_ASSERT_ERR(length >= 0 && length < PATH_MAX);
+    SOFT_ASSERT_ERR(access(path, X_OK) == 0);
     if (fl_err != 0)
     {
       return 1;
     }
-    length = snprintf(binary, sizeof(binary), "%s/%s", directory, argv[1]);
-  }
-  SOFT_ASSERT_ERR(length >= 0 && (size_t)length < sizeof(binary));
-  SOFT_ASSERT_ERR(access(binary, X_OK) == 0);
-  if (fl_err != 0)
-  {
-    return 1;
   }
 
   test_defaults();
   test_help();
+  test_partial_arguments();
+  test_parameter_boundaries();
+  test_leading_zeroes();
   test_fixed_durations();
   test_zero_thinking();
   test_serial_forks();
@@ -891,17 +1131,25 @@ int main(int argc, char **argv)
   test_repeated_runs();
   test_non_neighbours();
   test_various_inputs();
+  test_invalid_numbers();
+  test_philosopher_limit();
   test_invalid_inputs();
   test_signals();
   test_signal_while_thinking();
+  test_child_failures();
+  test_group_signals();
   test_soft_assert_diagnostics();
   test_log_open_error();
   test_log_write_error();
   test_closed_output();
+  if (argc == 3)
+  {
+    test_resource_failures();
+  }
 
   if (fl_err == 0)
   {
-    puts("OK: all 23 tests passed");
+    printf("OK: all %d tests passed\n", argc == 3 ? 31 : 30);
     return 0;
   }
   fprintf(stderr, "FAILED: %d checks\n", fl_err);

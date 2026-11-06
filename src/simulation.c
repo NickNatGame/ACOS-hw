@@ -3,13 +3,16 @@
 #include "soft_assert.h"
 
 #include <errno.h>
-#include <limits.h>
-#include <pthread.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <semaphore.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef enum
 {
@@ -29,9 +32,6 @@ static int check_stop(Simulation *simulation);
 typedef struct
 {
   State state;
-  int id;
-  Simulation *simulation;
-  pthread_t thread;
   sem_t wake; /* Выдача вилок, старт и остановка будят владельца семафора */
   int cycles_done;
   int meals_started;
@@ -47,16 +47,21 @@ typedef struct
     поэтому пришлось выкручиваться так*/
 struct Simulation
 {
-  const Parameters *parameters;
-  pthread_mutex_t mutex; /* Защищает очередь, вилки, состояния и весь вывод */
+  Parameters parameters;
+  pid_t parent_pid;
+  sem_t mutex; /* Защищает очередь, вилки, состояния и весь вывод */
   struct timespec started_at;
   int sem_count;
+  int mutex_ready;
   int stopped;
   int result;
-  const char *reason;
-  Philosopher *philosophers;
-  int *fork_owner; /* -1 - свободна, иначе индекс владельца */
-  int *queue;      /* Ссылка на массив, содержащий индексы голодных */
+  char reason[128];
+
+  /* В общей памяти храним сами данные, а не адреса из памяти родителя */
+  Philosopher philosophers[MAX_PHILOSOPHERS];
+  int fork_owner[MAX_PHILOSOPHERS]; /* -1 - свободна, иначе индекс владельца */
+  int queue[MAX_PHILOSOPHERS];
+
   int queue_head;
   int queue_tail;
   int queue_size;
@@ -64,63 +69,124 @@ struct Simulation
   long long now_ms;
 };
 
-static int init_simulation(Simulation *simulation, int count)
+static int free_simulation(Simulation *simulation)
 {
   int fl_err = 0;
-  size_t size = (size_t)count;
-
-  /* проверяем размер до начала всего */
-  SOFT_ASSERT_ERR(size <= SIZE_MAX / sizeof(Philosopher));
-  SOFT_ASSERT_ERR(size <= SIZE_MAX / sizeof(int));
-  if (fl_err != 0)
+  for (int i = 0; i < simulation->sem_count; i++)
   {
-    print_log("Ошибка: размер массивов не помещается в size_t.\n");
-    return -1;
+    SOFT_ASSERT_ERR(sem_destroy(&simulation->philosophers[i].wake) == 0);
+  }
+  if (simulation->mutex_ready)
+  {
+    SOFT_ASSERT_ERR(sem_destroy(&simulation->mutex) == 0);
+  }
+  SOFT_ASSERT_ERR(munmap(simulation, sizeof(*simulation)) == 0);
+  return fl_err == 0 ? 0 : -1;
+}
+
+static Simulation *init_simulation(const Parameters *parameters)
+{
+  char name[64];
+  snprintf(name, sizeof(name), "/philosophers-%ld", (long)getpid());
+  int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (fd == -1)
+  {
+    print_log("Ошибка shm_open: %s\n", strerror(errno));
+    return NULL;
   }
 
-  simulation->philosophers = calloc(size, sizeof(Philosopher));
-  simulation->fork_owner = calloc(size, sizeof(int));
-  simulation->queue = calloc(size, sizeof(int));
-  SOFT_ASSERT_ERR(simulation->philosophers != NULL);
-  SOFT_ASSERT_ERR(simulation->fork_owner != NULL);
-  SOFT_ASSERT_ERR(simulation->queue != NULL);
-  if (fl_err != 0)
+  /* Имя больше не нужно: дети получат отображение памяти через fork */
+  if (shm_unlink(name) == -1)
   {
-    print_log("Ошибка: не удалось выделить память для %d философов.\n", count);
-    return -1;
+    print_log("Ошибка shm_unlink: %s\n", strerror(errno));
+    close(fd);
+    return NULL;
   }
-  for (int i = 0; i < count; i++)
+
+  /* Резервируем место, чтобы нехватка /dev/shm не дала SIGBUS при записи */
+  int error = posix_fallocate(fd, 0, sizeof(Simulation));
+  if (error != 0)
   {
-    Philosopher *philosopher = &simulation->philosophers[i];
-    philosopher->id = i;
-    philosopher->simulation = simulation;
-    philosopher->state = WAITING;
+    print_log("Ошибка posix_fallocate: %s\n", strerror(error));
+    close(fd);
+    return NULL;
+  }
+  Simulation *simulation = mmap(NULL, sizeof(Simulation), PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+  int map_error = errno;
+  int close_result = close(fd);
+  if (simulation == MAP_FAILED)
+  {
+    print_log("Ошибка mmap: %s\n", strerror(map_error));
+    return NULL;
+  }
+  if (close_result == -1)
+  {
+    print_log("Ошибка close shared memory: %s\n", strerror(errno));
+    munmap(simulation, sizeof(*simulation));
+    return NULL;
+  }
+
+  simulation->parameters = *parameters;
+  simulation->parent_pid = getpid();
+  if (sem_init(&simulation->mutex, 1, 1) == -1)
+  {
+    print_log("Ошибка sem_init общего семафора: %s\n", strerror(errno));
+    free_simulation(simulation);
+    return NULL;
+  }
+  simulation->mutex_ready = 1;
+  for (int i = 0; i < parameters->count; i++)
+  {
     simulation->fork_owner[i] = -1;
-
-    /* Инициализируем семафор для конкретного философа*/
-    if (sem_init(&philosopher->wake, 0, 0) == -1)
+    if (sem_init(&simulation->philosophers[i].wake, 1, 0) == -1)
     {
       print_log("Ошибка sem_init: %s\n", strerror(errno));
-      return -1;
+      free_simulation(simulation);
+      return NULL;
     }
     simulation->sem_count++;
   }
-  return 0;
+  return simulation;
 }
 
-static void free_simulation(Simulation *simulation)
+/* 0 - получили семафор, 1 - тайм-аут или сигнал, -1 - ошибка */
+static int wait_semaphore(sem_t *semaphore, int milliseconds)
 {
-  /* Удаляем ненужные семафоры */
-  for (int i = 0; i < simulation->sem_count; i++)
+  struct timespec deadline;
+  if (clock_gettime(CLOCK_REALTIME, &deadline) == -1)
   {
-    sem_destroy(&simulation->philosophers[i].wake);
+    return -1;
   }
-  free(simulation->philosophers);
-  free(simulation->fork_owner);
-  free(simulation->queue);
+  deadline.tv_nsec += (long)milliseconds * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L)
+  {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  if (sem_timedwait(semaphore, &deadline) == 0)
+  {
+    return 0;
+  }
+  return errno == EINTR || errno == ETIMEDOUT ? 1 : -1;
 }
 
-/* Общий генератор вызывается только под мьютексом симуляции */
+/* Родитель проверяет детей отдельно, поэтому здесь ждут только философы */
+static int lock_simulation(Simulation *simulation)
+{
+  int result;
+  do
+  {
+    if (getppid() != simulation->parent_pid)
+    {
+      return -1;
+    }
+    result = wait_semaphore(&simulation->mutex, 10);
+  } while (result == 1 && !received_signal());
+  return result == 0 ? 0 : -1;
+}
+
+/* У каждого процесса своя копия генератора rand */
 static int random_time(int minimum, int maximum)
 {
   long long range = (long long)maximum - minimum + 1;
@@ -197,7 +263,7 @@ static void release_forks(Simulation *simulation, int id, int count)
             simulation->now_ms, id + 1, left + 1, right + 1);
 }
 
-/* Вызывается потоком философа под общим мьютексом. */
+/* Вызывается процессом философа под общим семафором. */
 static void finish_thinking(Simulation *simulation, const Parameters *parameters,
                             int id)
 {
@@ -284,7 +350,7 @@ static void give_forks(Simulation *simulation, const Parameters *parameters)
               "на %d ms\n",
               simulation->now_ms, id + 1, waited, duration);
     
-    /* Ставит семофор и говорит потоку философа, что выдали вилки */
+    /* Будим процесс философа, которому выдали вилки */
     if (sem_post(&philosopher->wake) == -1)
     {
       stop_simulation(simulation, 1, "ошибка sem_post при выдаче вилок");
@@ -293,11 +359,9 @@ static void give_forks(Simulation *simulation, const Parameters *parameters)
   }
 }
 
-/* Все функции работы с общим состоянием вызываются под mutex. */
+/* Все функции работы с общим состоянием вызываются под общим семафором */
 static void update_time(Simulation *simulation)
 {
-  /* Так как теперь у нас потоков много, то работать с виртуальным временем не выйдет,
-      пришлось вот так выкручиваться*/
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
   {
@@ -330,22 +394,23 @@ static void stop_simulation(Simulation *simulation, int result,
 
   simulation->stopped = 1;
   simulation->result = result;
-  simulation->reason = reason;
+  snprintf(simulation->reason, sizeof(simulation->reason), "%s", reason);
 
   /* Будим и ожидающих вилок, и спящих */
-  for (int i = 0; i < simulation->parameters->count; i++)
+  for (int i = 0; i < simulation->parameters.count; i++)
   {
     if (sem_post(&simulation->philosophers[i].wake) == -1)
     {
       simulation->result = 1;
-      simulation->reason = "ошибка sem_post при остановке";
+      snprintf(simulation->reason, sizeof(simulation->reason),
+                "ошибка sem_post при остановке");
     }
   }
 }
 
 static int check_stop(Simulation *simulation)
 {
-  const Parameters *parameters = simulation->parameters;
+  const Parameters *parameters = &simulation->parameters;
 
   update_time(simulation);
   if (simulation->stopped)
@@ -381,48 +446,33 @@ static int check_stop(Simulation *simulation)
   return simulation->stopped;
 }
 
-/* Ожидание на время раздумий или еды, во время которого мы отпускаем мьютекс */
-static int wait_until(Philosopher *philosopher)
+/* 1 - время прошло, 0 - остановка
+   в обоих случаях семафор занят нами
+   При -1 общий семафор уже не удерживается, процесс должен завершиться */
+static int wait_until(Simulation *simulation, int id)
 {
-  Simulation *simulation = philosopher->simulation;
+  Philosopher *philosopher = &simulation->philosophers[id];
 
   while (!check_stop(simulation) &&
          simulation->now_ms < philosopher->next_event_ms)
   {
     long long remaining = philosopher->next_event_ms - simulation->now_ms;
 
-    /* Просыпаемся каждые 10 милисекунд, чтобы не фулл тайм занимать проц*/
+    /* Проверяем остановку каждые 10 ms, не удерживая общий семафор */
     if (remaining > 10)
     {
       remaining = 10;
     }
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_REALTIME, &deadline) == -1)
+    if (sem_post(&simulation->mutex) == -1)
     {
-      stop_simulation(simulation, 1, "ошибка clock_gettime");
-      break;
+      return -1;
     }
-
-    deadline.tv_nsec += (long)remaining * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L)
+    int result = wait_semaphore(&philosopher->wake, (int)remaining);
+    if (lock_simulation(simulation) == -1)
     {
-      deadline.tv_sec++;
-      deadline.tv_nsec -= 1000000000L;
+      return -1;
     }
-
-    /* Вот тут как раз освободили мьютекс, чтобы остальные могли им пользоваться */
-    pthread_mutex_unlock(&simulation->mutex);
-    int result;
-    do
-    {
-      /* Блокируем поток до дд */
-      result = sem_timedwait(&philosopher->wake, &deadline);
-    } while (result == -1 && errno == EINTR);
-
-    int error = errno;
-    pthread_mutex_lock(&simulation->mutex);
-
-    if (result == -1 && error != ETIMEDOUT)
+    if (result == -1)
     {
       stop_simulation(simulation, 1, "ошибка sem_timedwait");
     }
@@ -431,51 +481,72 @@ static int wait_until(Philosopher *philosopher)
 }
 
 /* Тут ожидание семафора */
-static int wait_wakeup(Philosopher *philosopher)
+static int wait_wakeup(Simulation *simulation, int id)
 {
   int result;
   do
   {
-    result = sem_wait(&philosopher->wake);
-  } while (result == -1 && errno == EINTR);
+    if (getppid() != simulation->parent_pid)
+    {
+      return -1;
+    }
+    result = wait_semaphore(&simulation->philosophers[id].wake, 10);
+  } while (result == 1 && !received_signal());
   return result;
 }
 
-static void *philosopher_main(void *argument)
+static int philosopher_main(Simulation *simulation, int id)
 {
-  Philosopher *philosopher = argument;
-  Simulation *simulation = philosopher->simulation;
-  const Parameters *parameters = simulation->parameters;
-  int id = philosopher->id;
+  Philosopher *philosopher = &simulation->philosophers[id];
+  const Parameters *parameters = &simulation->parameters;
+  srand((unsigned int)parameters->seed + (unsigned int)id);
 
-  int result = wait_wakeup(philosopher); /* Ждем ожидания для общего старта */
-  pthread_mutex_lock(&simulation->mutex);
+  int result = wait_wakeup(simulation, id);
+  if (lock_simulation(simulation) == -1)
+  {
+    return 1;
+  }
 
   if (result == -1)
   {
-    stop_simulation(simulation, 1, "ошибка sem_wait при старте");
+    stop_simulation(simulation, 1, "ошибка ожидания при старте");
   }
   while (!check_stop(simulation))
   {
 
     start_thinking(simulation, parameters, id);
-    if (!wait_until(philosopher))
+    result = wait_until(simulation, id);
+    if (result == -1)
+    {
+      return 1;
+    }
+    if (result == 0)
     {
       break;
     }
     finish_thinking(simulation, parameters, id);
 
-    /* Раздаем вилки и разлочиваем мбютекс, чтобы их могли взять*/
+    /* Ожидание вилок не должно мешать другим процессам */
     give_forks(simulation, parameters);
-    pthread_mutex_unlock(&simulation->mutex);
-    result = wait_wakeup(philosopher);
-
-    pthread_mutex_lock(&simulation->mutex);
+    if (sem_post(&simulation->mutex) == -1)
+    {
+      return 1;
+    }
+    result = wait_wakeup(simulation, id);
+    if (lock_simulation(simulation) == -1)
+    {
+      return 1;
+    }
     if (result == -1)
     {
-      stop_simulation(simulation, 1, "ошибка sem_wait при ожидании вилок");
+      stop_simulation(simulation, 1, "ошибка ожидания вилок");
     }
-    if (check_stop(simulation) || !wait_until(philosopher))
+    result = wait_until(simulation, id);
+    if (result == -1)
+    {
+      return 1;
+    }
+    if (result == 0)
     {
       break;
     }
@@ -506,8 +577,7 @@ static void *philosopher_main(void *argument)
       break;
     }
   }
-  pthread_mutex_unlock(&simulation->mutex);
-  return NULL;
+  return sem_post(&simulation->mutex) == 0 ? 0 : 1;
 }
 
 static void stop_philosophers(Simulation *simulation, int count)
@@ -536,6 +606,11 @@ static void stop_philosophers(Simulation *simulation, int count)
       }
     }
     philosopher->state = STOPPED;
+  }
+  /* При гибели процесса он мог не закончить изменение владельцев вилок */
+  for (int i = 0; i < count; i++)
+  {
+    simulation->fork_owner[i] = -1;
   }
   simulation->queue_size = 0;
 }
@@ -569,24 +644,114 @@ static void print_statistics(const Simulation *simulation,
   print_log("Время работы: %lld ms\n", simulation->now_ms);
 }
 
+/* PID обнуляем только после waitpid */
+static int reap_children(pid_t children[], int count)
+{
+  int failed = 0;
+  for (int i = 0; i < count; i++)
+  {
+    if (children[i] == 0)
+    {
+      continue;
+    }
+    int status = 0;
+    pid_t waited = waitpid(children[i], &status, WNOHANG | WUNTRACED);
+    if (waited == -1 && errno != EINTR)
+    {
+      int error = errno;
+      dprintf(STDERR_FILENO, "Ошибка waitpid: %s\n", strerror(error));
+      if (error == ECHILD)
+      {
+        children[i] = 0;
+      }
+      failed = 1;
+    }
+    else if (waited > 0)
+    {
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      {
+        dprintf(STDERR_FILENO, "Ошибка: процесс философа %d (PID %ld) "
+                               "аварийно завершился или был остановлен.\n",
+                i + 1, (long)children[i]);
+        failed = 1;
+      }
+      if (!WIFSTOPPED(status))
+      {
+        children[i] = 0;
+      }
+    }
+  }
+  return failed;
+}
+
+static int signal_children(const pid_t children[], int count, int number)
+{
+  int fl_err = 0;
+  for (int i = 0; i < count; i++)
+  {
+    if (children[i] > 0)
+    {
+      int result = kill(children[i], number);
+      SOFT_ASSERT_ERR(result == 0 || errno == ESRCH);
+    }
+  }
+  return fl_err == 0 ? 0 : -1;
+}
+
+static int wait_children(pid_t children[], int count)
+{
+  int fl_err = 0;
+  for (int attempt = 0; attempt < 200; attempt++)
+  {
+    SOFT_ASSERT_ERR(reap_children(children, count) == 0);
+    int remaining = 0;
+    for (int i = 0; i < count; i++)
+    {
+      remaining += children[i] > 0;
+    }
+    if (remaining == 0)
+    {
+      return fl_err == 0 ? 0 : -1;
+    }
+    struct timespec pause = {0, 5000000L};
+    nanosleep(&pause, NULL);
+  }
+
+  /* Зависший или остановленный процесс не должен удерживать приложение */
+  dprintf(STDERR_FILENO, "Ошибка: дети не завершились, отправляем SIGKILL.\n");
+  signal_children(children, count, SIGKILL);
+  for (int i = 0; i < count; i++)
+  {
+    if (children[i] == 0)
+    {
+      continue;
+    }
+    pid_t waited;
+    do
+    {
+      waited = waitpid(children[i], NULL, 0);
+    } while (waited == -1 && errno == EINTR);
+    SOFT_ASSERT_ERR(waited == children[i]);
+    children[i] = 0;
+  }
+  return -1;
+}
+
 int run_simulation(const Parameters *parameters)
 {
-  Simulation simulation = {.parameters = parameters};
-  int error = pthread_mutex_init(&simulation.mutex, NULL);
-
-  if (error != 0)
+  Simulation *simulation = init_simulation(parameters);
+  if (simulation == NULL)
   {
-    print_log("Ошибка pthread_mutex_init: %s\n", strerror(error));
-    return 1;
+    return received_signal() ? 128 + received_signal() : 1;
   }
-  if (init_simulation(&simulation, parameters->count) == -1)
+  if (wait_semaphore(&simulation->mutex, 10) != 0)
   {
-    free_simulation(&simulation);
-    pthread_mutex_destroy(&simulation.mutex);
-    return 1;
+    print_log("Ошибка ожидания общего семафора при запуске.\n");
+    free_simulation(simulation);
+    return received_signal() ? 128 + received_signal() : 1;
   }
 
-  print_log("=== Обедающие философы: многопоточная модель pthread ===\n"
+  print_log("=== Обедающие философы: процессы и неименованные POSIX семафоры ===\n"
             "Философов/вилок: %d, циклов: %d, стратегия: fifo.\n"
             "Размышление: %d..%d ms, еда: %d..%d ms.\n"
             "Лимит ожидания: %d ms, общий лимит: %d ms (0 — отключён).\n"
@@ -597,89 +762,119 @@ int run_simulation(const Parameters *parameters)
             parameters->display_delay, parameters->seed);
 
   srand((unsigned int)parameters->seed);
-
+  pid_t children[MAX_PHILOSOPHERS] = {0};
   int created = 0;
   for (int i = 0; i < parameters->count; i++)
   {
-    /* Создаем поток для конкретного философа */
-    error = pthread_create(&simulation.philosophers[i].thread, NULL,
-                           philosopher_main, &simulation.philosophers[i]);
-
-    if (error != 0)
+    if (received_signal() || output_failed())
     {
-      print_log("Ошибка pthread_create для философа %d: %s\n", i + 1,
-                strerror(error));
       break;
     }
+    pid_t child = fork();
+    if (child == -1)
+    {
+      print_log("Ошибка fork для философа %d: %s\n", i + 1, strerror(errno));
+      break;
+    }
+    if (child == 0)
+    {
+      _exit(philosopher_main(simulation, i));
+    }
+    children[i] = child;
     created++;
+    print_log("Процесс философа %d: PID %ld.\n", i + 1, (long)child);
   }
 
-  pthread_mutex_lock(&simulation.mutex);
-
-  /* Тут мы записываем время старта, проверяем, всех ли записали и тд*/
-  if (clock_gettime(CLOCK_MONOTONIC, &simulation.started_at) == -1)
+  if (clock_gettime(CLOCK_MONOTONIC, &simulation->started_at) == -1)
   {
-    stop_simulation(&simulation, 1, "ошибка clock_gettime при старте");
+    stop_simulation(simulation, 1, "ошибка clock_gettime при старте");
   }
-
+  else if (received_signal())
+  {
+    stop_simulation(simulation, 128 + received_signal(),
+                    "прерывание пользователем (SIGINT/SIGTERM)");
+  }
   else if (created != parameters->count)
   {
-    stop_simulation(&simulation, 1, "не удалось создать все потоки");
+    stop_simulation(simulation, 1, "не удалось создать все процессы");
   }
-
-  else if (!check_stop(&simulation))
+  else if (!check_stop(simulation))
   {
-    /* тут всем философам разрешаем начало работы */
     for (int i = 0; i < created; i++)
     {
-      if (sem_post(&simulation.philosophers[i].wake) == -1)
+      if (sem_post(&simulation->philosophers[i].wake) == -1)
       {
-        stop_simulation(&simulation, 1, "ошибка sem_post при старте");
+        stop_simulation(simulation, 1, "ошибка sem_post при старте");
         break;
       }
     }
   }
 
+  int emergency = sem_post(&simulation->mutex) == -1;
   long long next_snapshot = 0;
-  while (!check_stop(&simulation))
+  while (!emergency)
   {
-    if (parameters->display_delay > 0 && simulation.now_ms >= next_snapshot)
+    if (reap_children(children, created))
     {
-      print_snapshot(&simulation, parameters->count);
-      next_snapshot = simulation.now_ms + parameters->display_delay;
+      emergency = 1;
+      break;
     }
-
-    pthread_mutex_unlock(&simulation.mutex);
+    int locked = wait_semaphore(&simulation->mutex, 10);
+    if (locked == -1 || (locked == 1 && received_signal()))
+    {
+      emergency = 1;
+      break;
+    }
+    if (locked == 1)
+    {
+      continue;
+    }
+    int stopped = check_stop(simulation);
+    if (!stopped && parameters->display_delay > 0 &&
+        simulation->now_ms >= next_snapshot)
+    {
+      print_snapshot(simulation, parameters->count);
+      next_snapshot = simulation->now_ms + parameters->display_delay;
+    }
+    emergency = sem_post(&simulation->mutex) == -1;
+    if (stopped)
+    {
+      break;
+    }
     pause_display(5);
-    pthread_mutex_lock(&simulation.mutex);
   }
 
-  pthread_mutex_unlock(&simulation.mutex);
-  for (int i = 0; i < created; i++)
+  if (emergency)
   {
-    /* Дожидаемся окончания работы каждого потока */
-    error = pthread_join(simulation.philosophers[i].thread, NULL);
-
-    /* Ресурсы нельзя освобождать, если поток ещё может их читать */
-    if (error != 0)
-    {
-      print_log("Ошибка pthread_join: %s\n", strerror(error));
-      return 1;
-    }
+    /* Общий семафор мог остаться у погибшего процесса, его больше не ждём */
+    signal_children(children, created, SIGTERM);
+  }
+  int wait_error = wait_children(children, created);
+  if (emergency || wait_error == -1)
+  {
+    /* Теперь детей нет, поэтому состояние можно исправить без семафора */
+    update_time(simulation);
+    simulation->stopped = 1;
+    simulation->result = received_signal() ? 128 + received_signal() : 1;
+    snprintf(simulation->reason, sizeof(simulation->reason), "%s",
+              received_signal() ? "прерывание пользователем (SIGINT/SIGTERM)"
+                                : "аварийное завершение дочернего процесса или ошибка синхронизации");
   }
 
   print_log("\n=== Итоги моделирования ===\nПричина завершения: %s.\n",
-            simulation.reason);
-  stop_philosophers(&simulation, parameters->count);
-  print_snapshot(&simulation, parameters->count);
-  print_statistics(&simulation, parameters);
+            simulation->reason);
+  stop_philosophers(simulation, parameters->count);
+  print_snapshot(simulation, parameters->count);
+  print_statistics(simulation, parameters);
   if (!output_failed())
   {
     print_log("Лог: philosophers.log\n");
   }
   
-  int result = output_failed() ? 1 : simulation.result;
-  free_simulation(&simulation);
-  pthread_mutex_destroy(&simulation.mutex);
+  int result = output_failed() ? 1 : simulation->result;
+  if (free_simulation(simulation) == -1)
+  {
+    result = 1;
+  }
   return result;
 }

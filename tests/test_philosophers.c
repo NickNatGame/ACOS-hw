@@ -1,6 +1,7 @@
 #include "philosophers.h"
 #include "soft_assert.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -14,6 +15,7 @@ static int fl_err = 0;
 static char binary[PATH_MAX];
 static char fault_binary[PATH_MAX];
 static const char *failure = NULL;
+static int named_semaphores = 0;
 
 /* Оба выражения вычисляем только один раз. long long подходит и для времени */
 #define SOFT_ASSERT_EQ_ERR(a, b)                                          \
@@ -128,6 +130,24 @@ static int read_children(pid_t parent, pid_t children[])
   }
   SOFT_ASSERT_ERR(fclose(file) == 0);
   return count;
+}
+
+static void check_semaphore_cleanup(pid_t parent)
+{
+  char prefix[64];
+  snprintf(prefix, sizeof(prefix), "sem.philosophers-%ld-", (long)parent);
+  DIR *directory = opendir("/dev/shm");
+  SOFT_ASSERT_ERR(directory != NULL);
+  if (directory == NULL)
+  {
+    return;
+  }
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL)
+  {
+    SOFT_ASSERT_ERR(strncmp(entry->d_name, prefix, strlen(prefix)) != 0);
+  }
+  SOFT_ASSERT_ERR(closedir(directory) == 0);
 }
 
 /* Каждый запуск получает отдельный каталог, чтобы не затереть журнал пользователя */
@@ -343,6 +363,7 @@ static TestRun run_case(char *const arguments[], int expected_code,
     snprintf(shared_path, sizeof(shared_path), "/dev/shm/philosophers-%ld",
               (long)child);
     SOFT_ASSERT_ERR(access(shared_path, F_OK) == -1 && errno == ENOENT);
+    check_semaphore_cleanup(child);
     /* Родитель обязан дождаться каждого PID, который сообщил при запуске */
     const char *line = run.output;
     while (line != NULL && (line = strstr(line, "Процесс философа ")) != NULL)
@@ -1009,7 +1030,7 @@ static void test_resource_failures(void)
                             "fork", "clock", "sem_wait", "sem_post",
                             "lock_death", "lock_stop", "startup_signal"};
   const char *messages[] = {"Ошибка shm_open", "Ошибка posix_fallocate", "Ошибка mmap",
-                            "Ошибка sem_init", "Ошибка sem_init", "Ошибка fork",
+                            "Ошибка создания общего семафора", "Ошибка создания персонального семафора", "Ошибка fork",
                             "ошибка clock_gettime", "аварийное завершение дочернего процесса",
                             "ошибка sem_post", "аварийное завершение дочернего процесса",
                             "аварийное завершение дочернего процесса", "прерывание пользователем"};
@@ -1021,6 +1042,32 @@ static void test_resource_failures(void)
     TestRun run = run_case(arguments, i == 11 ? 130 : 1, 0, NORMAL);
     check_contains(run.output, messages[i]);
     SOFT_ASSERT_ERR(run.log_exists);
+    free_run(run);
+  }
+  failure = NULL;
+  strcpy(binary, original);
+}
+
+static void test_named_semaphore_failures(void)
+{
+  char original[PATH_MAX];
+  strcpy(original, binary);
+  strcpy(binary, fault_binary);
+  const char *failures[] = {"sem_open", "sem_unlink", "sem_close"};
+  for (int i = 0; i < 3; i++)
+  {
+    failure = failures[i];
+    char *arguments[] = {"2", "1", "0", "0", "1", "1", "1000", "0",
+                         "42", "fifo", "1000", NULL};
+    TestRun run = run_case(arguments, 1, 0, NORMAL);
+    if (i < 2)
+    {
+      check_contains(run.output, "Ошибка создания общего семафора");
+    }
+    else
+    {
+      check_contains(run.errors, "close_semaphore");
+    }
     free_run(run);
   }
   failure = NULL;
@@ -1081,12 +1128,13 @@ static void test_closed_output(void)
 
 int main(int argc, char **argv)
 {
-  if (argc < 2 || argc > 3)
+  if (argc < 2 || argc > 4 || (argc == 4 && strcmp(argv[3], "named") != 0))
   {
-    fprintf(stderr, "Использование: %s путь_к_программе [путь_к_программе_с_подменами]\n", argv[0]);
+    fprintf(stderr, "Использование: %s путь_к_программе [путь_к_программе_с_подменами [named]]\n", argv[0]);
     return 1;
   }
-  for (int i = 1; i < argc; i++)
+  named_semaphores = argc == 4;
+  for (int i = 1; i < argc && i <= 2; i++)
   {
     char *path = i == 1 ? binary : fault_binary;
     int length;
@@ -1142,14 +1190,18 @@ int main(int argc, char **argv)
   test_log_open_error();
   test_log_write_error();
   test_closed_output();
-  if (argc == 3)
+  if (argc >= 3)
   {
     test_resource_failures();
+  }
+  if (named_semaphores)
+  {
+    test_named_semaphore_failures();
   }
 
   if (fl_err == 0)
   {
-    printf("OK: all %d tests passed\n", argc == 3 ? 31 : 30);
+    printf("OK: all %d tests passed\n", (argc >= 3 ? 31 : 30) + named_semaphores);
     return 0;
   }
   fprintf(stderr, "FAILED: %d checks\n", fl_err);

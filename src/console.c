@@ -21,7 +21,7 @@ static atomic_int stop_signal = 0;
 /* Обработчик только запоминает сигнал. Итоги печатает основная программа */
 static void handle_signal(int number) { stop_signal = number; }
 
-int open_console(void) {
+int open_console_mode(int defer_log) {
   int fl_err = 0;
   struct sigaction action = {0};
   action.sa_handler = handle_signal;
@@ -43,13 +43,29 @@ int open_console(void) {
     return -1;
   }
 
-  log_fd = open("philosophers.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  /* Журнал сессии открываем только после успешного создания/подключения */
+  log_fd = open(defer_log ? "/dev/null" : "philosophers.log",
+                O_WRONLY | O_CREAT | O_APPEND | (defer_log ? 0 : O_TRUNC), 0644);
   SOFT_ASSERT_ERR(log_fd >= 0);
   if (fl_err != 0) {
     dprintf(STDERR_FILENO, "Ошибка открытия лога: %s\n", strerror(errno));
     return -1;
   }
   return 0;
+}
+
+int open_console(void) { return open_console_mode(0); }
+
+int attach_console_log(const char *path, int create)
+{
+  int fd = open(path, O_WRONLY | O_APPEND | (create ? O_CREAT | O_TRUNC : 0), 0644);
+  if (fd == -1)
+  {
+    return -1;
+  }
+  int result = close(log_fd);
+  log_fd = fd;
+  return result;
 }
 
 void print_log(const char *format, ...) {

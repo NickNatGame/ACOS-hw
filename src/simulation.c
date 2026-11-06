@@ -1,6 +1,11 @@
 #include "console.h"
 #include "philosophers.h"
+#include "semaphores.h"
 #include "soft_assert.h"
+#ifdef INDEPENDENT_PROCESSES
+#include "session.h"
+#include <limits.h>
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,10 +34,18 @@ static void stop_simulation(Simulation *simulation, int result,
                             const char *reason);
 static int check_stop(Simulation *simulation);
 
+/* Локальные указатели, которые либо наследуются при fork, либо заполняются через sem_open */
+static sem_t *mutex = NULL;
+static sem_t *wake[MAX_PHILOSOPHERS] = {0};
+#ifdef INDEPENDENT_PROCESSES
+static char memory_name[80];
+static int memory_created;
+#endif
+
 typedef struct
 {
   State state;
-  sem_t wake; /* Выдача вилок, старт и остановка будят владельца семафора */
+  sem_t wake; /* Хранилище персонального семафора неименованной версии */
   int cycles_done;
   int meals_started;
   long long next_event_ms; /* Когда закончится размышление или еда */
@@ -67,6 +80,12 @@ struct Simulation
   int queue_size;
   int finished;
   long long now_ms;
+#ifdef INDEPENDENT_PROCESSES
+  pid_t participants[MAX_PHILOSOPHERS];
+  int departed[MAX_PHILOSOPHERS];
+  int started;
+  char log_path[PATH_MAX];
+#endif
 };
 
 static int free_simulation(Simulation *simulation)
@@ -74,11 +93,11 @@ static int free_simulation(Simulation *simulation)
   int fl_err = 0;
   for (int i = 0; i < simulation->sem_count; i++)
   {
-    SOFT_ASSERT_ERR(sem_destroy(&simulation->philosophers[i].wake) == 0);
+    SOFT_ASSERT_ERR(close_semaphore(wake[i]) == 0);
   }
   if (simulation->mutex_ready)
   {
-    SOFT_ASSERT_ERR(sem_destroy(&simulation->mutex) == 0);
+    SOFT_ASSERT_ERR(close_semaphore(mutex) == 0);
   }
   SOFT_ASSERT_ERR(munmap(simulation, sizeof(*simulation)) == 0);
   return fl_err == 0 ? 0 : -1;
@@ -86,8 +105,12 @@ static int free_simulation(Simulation *simulation)
 
 static Simulation *init_simulation(const Parameters *parameters)
 {
-  char name[64];
+  char name[80];
+#ifdef INDEPENDENT_PROCESSES
+  snprintf(name, sizeof(name), "%s", memory_name);
+#else
   snprintf(name, sizeof(name), "/philosophers-%ld", (long)getpid());
+#endif
   int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
   if (fd == -1)
   {
@@ -95,13 +118,17 @@ static Simulation *init_simulation(const Parameters *parameters)
     return NULL;
   }
 
-  /* Имя больше не нужно: дети получат отображение памяти через fork */
+#ifdef INDEPENDENT_PROCESSES
+  memory_created = 1;
+#else
+  /* Имя больше не нужно, дети получат отображение памяти через fork */
   if (shm_unlink(name) == -1)
   {
     print_log("Ошибка shm_unlink: %s\n", strerror(errno));
     close(fd);
     return NULL;
   }
+#endif
 
   /* Резервируем место, чтобы нехватка /dev/shm не дала SIGBUS при записи */
   int error = posix_fallocate(fd, 0, sizeof(Simulation));
@@ -112,7 +139,7 @@ static Simulation *init_simulation(const Parameters *parameters)
     return NULL;
   }
   Simulation *simulation = mmap(NULL, sizeof(Simulation), PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, fd, 0);
+                                MAP_SHARED, fd, 0);
   int map_error = errno;
   int close_result = close(fd);
   if (simulation == MAP_FAILED)
@@ -129,9 +156,17 @@ static Simulation *init_simulation(const Parameters *parameters)
 
   simulation->parameters = *parameters;
   simulation->parent_pid = getpid();
-  if (sem_init(&simulation->mutex, 1, 1) == -1)
+  mutex = open_semaphore(&simulation->mutex, "mutex",
+#ifdef INDEPENDENT_PROCESSES
+                         0
+#else
+                         1
+#endif
+  );
+
+  if (mutex == NULL)
   {
-    print_log("Ошибка sem_init общего семафора: %s\n", strerror(errno));
+    print_log("Ошибка создания общего семафора: %s\n", strerror(errno));
     free_simulation(simulation);
     return NULL;
   }
@@ -139,9 +174,12 @@ static Simulation *init_simulation(const Parameters *parameters)
   for (int i = 0; i < parameters->count; i++)
   {
     simulation->fork_owner[i] = -1;
-    if (sem_init(&simulation->philosophers[i].wake, 1, 0) == -1)
+    char name[32];
+    snprintf(name, sizeof(name), "wake-%d", i);
+    wake[i] = open_semaphore(&simulation->philosophers[i].wake, name, 0);
+    if (wake[i] == NULL)
     {
-      print_log("Ошибка sem_init: %s\n", strerror(errno));
+      print_log("Ошибка создания персонального семафора: %s\n", strerror(errno));
       free_simulation(simulation);
       return NULL;
     }
@@ -158,7 +196,8 @@ static int wait_semaphore(sem_t *semaphore, int milliseconds)
   {
     return -1;
   }
-  deadline.tv_nsec += (long)milliseconds * 1000000L;
+  deadline.tv_sec += milliseconds / 1000;
+  deadline.tv_nsec += (long)(milliseconds % 1000) * 1000000L;
   if (deadline.tv_nsec >= 1000000000L)
   {
     deadline.tv_sec++;
@@ -171,17 +210,36 @@ static int wait_semaphore(sem_t *semaphore, int milliseconds)
   return errno == EINTR || errno == ETIMEDOUT ? 1 : -1;
 }
 
-/* Родитель проверяет детей отдельно, поэтому здесь ждут только философы */
+/* Координатор проверяет участников отдельно, так как здесь ждут только философы */
+static int coordinator_alive(const Simulation *simulation)
+{
+#ifdef INDEPENDENT_PROCESSES
+  return kill(simulation->parent_pid, 0) == 0 || errno == EPERM;
+#else
+  return getppid() == simulation->parent_pid;
+#endif
+}
+
 static int lock_simulation(Simulation *simulation)
 {
   int result;
+#ifdef INDEPENDENT_PROCESSES
+  int attempts = 0;
+#endif
   do
   {
-    if (getppid() != simulation->parent_pid)
+    if (!coordinator_alive(simulation))
     {
       return -1;
     }
-    result = wait_semaphore(&simulation->mutex, 10);
+#ifdef INDEPENDENT_PROCESSES
+    /* Независимый участник не должен вечно ждать умершего :( владельца mutex */
+    if (++attempts > 200)
+    {
+      return -1;
+    }
+#endif
+    result = wait_semaphore(mutex, 10);
   } while (result == 1 && !received_signal());
   return result == 0 ? 0 : -1;
 }
@@ -349,9 +407,9 @@ static void give_forks(Simulation *simulation, const Parameters *parameters)
     print_log("[%6lld ms] Философ %d: начал есть после ожидания %lld ms "
               "на %d ms\n",
               simulation->now_ms, id + 1, waited, duration);
-    
+
     /* Будим процесс философа, которому выдали вилки */
-    if (sem_post(&philosopher->wake) == -1)
+    if (sem_post(wake[id]) == -1)
     {
       stop_simulation(simulation, 1, "ошибка sem_post при выдаче вилок");
       return;
@@ -362,6 +420,12 @@ static void give_forks(Simulation *simulation, const Parameters *parameters)
 /* Все функции работы с общим состоянием вызываются под общим семафором */
 static void update_time(Simulation *simulation)
 {
+#ifdef INDEPENDENT_PROCESSES
+  if (!simulation->started)
+  {
+    return;
+  }
+#endif
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
   {
@@ -399,11 +463,11 @@ static void stop_simulation(Simulation *simulation, int result,
   /* Будим и ожидающих вилок, и спящих */
   for (int i = 0; i < simulation->parameters.count; i++)
   {
-    if (sem_post(&simulation->philosophers[i].wake) == -1)
+    if (sem_post(wake[i]) == -1)
     {
       simulation->result = 1;
       snprintf(simulation->reason, sizeof(simulation->reason),
-                "ошибка sem_post при остановке");
+               "ошибка sem_post при остановке");
     }
   }
 }
@@ -463,11 +527,11 @@ static int wait_until(Simulation *simulation, int id)
     {
       remaining = 10;
     }
-    if (sem_post(&simulation->mutex) == -1)
+    if (sem_post(mutex) == -1)
     {
       return -1;
     }
-    int result = wait_semaphore(&philosopher->wake, (int)remaining);
+    int result = wait_semaphore(wake[id], (int)remaining);
     if (lock_simulation(simulation) == -1)
     {
       return -1;
@@ -486,11 +550,11 @@ static int wait_wakeup(Simulation *simulation, int id)
   int result;
   do
   {
-    if (getppid() != simulation->parent_pid)
+    if (!coordinator_alive(simulation))
     {
       return -1;
     }
-    result = wait_semaphore(&simulation->philosophers[id].wake, 10);
+    result = wait_semaphore(wake[id], 10);
   } while (result == 1 && !received_signal());
   return result;
 }
@@ -528,7 +592,7 @@ static int philosopher_main(Simulation *simulation, int id)
 
     /* Ожидание вилок не должно мешать другим процессам */
     give_forks(simulation, parameters);
-    if (sem_post(&simulation->mutex) == -1)
+    if (sem_post(mutex) == -1)
     {
       return 1;
     }
@@ -577,7 +641,7 @@ static int philosopher_main(Simulation *simulation, int id)
       break;
     }
   }
-  return sem_post(&simulation->mutex) == 0 ? 0 : 1;
+  return sem_post(mutex) == 0 ? 0 : 1;
 }
 
 static void stop_philosophers(Simulation *simulation, int count)
@@ -644,6 +708,7 @@ static void print_statistics(const Simulation *simulation,
   print_log("Время работы: %lld ms\n", simulation->now_ms);
 }
 
+#ifndef INDEPENDENT_PROCESSES
 /* PID обнуляем только после waitpid */
 static int reap_children(pid_t children[], int count)
 {
@@ -744,19 +809,19 @@ int run_simulation(const Parameters *parameters)
   {
     return received_signal() ? 128 + received_signal() : 1;
   }
-  if (wait_semaphore(&simulation->mutex, 10) != 0)
+  if (wait_semaphore(mutex, 10) != 0)
   {
     print_log("Ошибка ожидания общего семафора при запуске.\n");
     free_simulation(simulation);
     return received_signal() ? 128 + received_signal() : 1;
   }
 
-  print_log("=== Обедающие философы: процессы и неименованные POSIX семафоры ===\n"
+  print_log("=== Обедающие философы: процессы и %s POSIX семафоры ===\n"
             "Философов/вилок: %d, циклов: %d, стратегия: fifo.\n"
             "Размышление: %d..%d ms, еда: %d..%d ms.\n"
             "Лимит ожидания: %d ms, общий лимит: %d ms (0 — отключён).\n"
             "Период показа: %d ms, seed: %d. Лог: philosophers.log\n\n",
-            parameters->count, parameters->cycles, parameters->think_min,
+            semaphore_kind(), parameters->count, parameters->cycles, parameters->think_min,
             parameters->think_max, parameters->eat_min, parameters->eat_max,
             parameters->max_wait, parameters->time_limit,
             parameters->display_delay, parameters->seed);
@@ -802,7 +867,7 @@ int run_simulation(const Parameters *parameters)
   {
     for (int i = 0; i < created; i++)
     {
-      if (sem_post(&simulation->philosophers[i].wake) == -1)
+      if (sem_post(wake[i]) == -1)
       {
         stop_simulation(simulation, 1, "ошибка sem_post при старте");
         break;
@@ -810,7 +875,7 @@ int run_simulation(const Parameters *parameters)
     }
   }
 
-  int emergency = sem_post(&simulation->mutex) == -1;
+  int emergency = sem_post(mutex) == -1;
   long long next_snapshot = 0;
   while (!emergency)
   {
@@ -819,7 +884,7 @@ int run_simulation(const Parameters *parameters)
       emergency = 1;
       break;
     }
-    int locked = wait_semaphore(&simulation->mutex, 10);
+    int locked = wait_semaphore(mutex, 10);
     if (locked == -1 || (locked == 1 && received_signal()))
     {
       emergency = 1;
@@ -836,7 +901,7 @@ int run_simulation(const Parameters *parameters)
       print_snapshot(simulation, parameters->count);
       next_snapshot = simulation->now_ms + parameters->display_delay;
     }
-    emergency = sem_post(&simulation->mutex) == -1;
+    emergency = sem_post(mutex) == -1;
     if (stopped)
     {
       break;
@@ -857,8 +922,8 @@ int run_simulation(const Parameters *parameters)
     simulation->stopped = 1;
     simulation->result = received_signal() ? 128 + received_signal() : 1;
     snprintf(simulation->reason, sizeof(simulation->reason), "%s",
-              received_signal() ? "прерывание пользователем (SIGINT/SIGTERM)"
-                                : "аварийное завершение дочернего процесса или ошибка синхронизации");
+             received_signal() ? "прерывание пользователем (SIGINT/SIGTERM)"
+                               : "аварийное завершение дочернего процесса или ошибка синхронизации");
   }
 
   print_log("\n=== Итоги моделирования ===\nПричина завершения: %s.\n",
@@ -870,7 +935,7 @@ int run_simulation(const Parameters *parameters)
   {
     print_log("Лог: philosophers.log\n");
   }
-  
+
   int result = output_failed() ? 1 : simulation->result;
   if (free_simulation(simulation) == -1)
   {
@@ -878,3 +943,404 @@ int run_simulation(const Parameters *parameters)
   }
   return result;
 }
+#endif
+
+#ifdef INDEPENDENT_PROCESSES
+static long long monotonic_ms(void)
+{
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+  {
+    return -1;
+  }
+  return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int remove_session(void)
+{
+  int result = unlink_session_semaphores();
+  if (memory_created && shm_unlink(memory_name) == -1)
+  {
+    dprintf(STDERR_FILENO, "Ошибка удаления shared memory: %s\n", strerror(errno));
+    result = -1;
+  }
+  return result;
+}
+
+/* kill(pid, 0) считает мертвые процессы и остановленные процессы существующими */
+static int participant_state(pid_t pid)
+{
+  if (kill(pid, 0) == -1 && errno == ESRCH)
+  {
+    return 1;
+  }
+
+  char path[64], line[1024];
+  snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+  FILE *file = fopen(path, "r");
+  int state = 0;
+
+  if (file)
+  {
+    if (fgets(line, sizeof(line), file))
+    {
+      char *end = strrchr(line, ')');
+      if (end && end[1] == ' ' & &end[2])
+      {
+        if (end[2] == 'Z' || end[2] == 'X')
+        {
+          state = 1;
+        }
+        else if (end[2] == 'T' || end[2] == 't')
+        {
+          state = 2;
+        }
+        else
+        {
+          state = 0;
+        }
+      }
+    }
+    fclose(file);
+  }
+  return state;
+}
+
+int run_coordinator(const char *name, const Parameters *parameters)
+{
+  snprintf(memory_name, sizeof(memory_name), "/philosophers-session-%s", name);
+  configure_session_semaphores(name, 1);
+
+  Simulation *simulation = init_simulation(parameters);
+  if (simulation == NULL)
+  {
+    remove_session();
+    return 1;
+  }
+
+  char directory[PATH_MAX];
+  int length = -1;
+  if (getcwd(directory, sizeof(directory)) != NULL)
+  {
+    length = snprintf(simulation->log_path, sizeof(simulation->log_path),
+                      "%s/philosophers-%s.log", directory, name);
+  }
+  if (length < 0 || (size_t)length >= sizeof(simulation->log_path) ||
+      attach_console_log(simulation->log_path, 1) == -1)
+  {
+    dprintf(STDERR_FILENO, "Ошибка подготовки сессии.\n");
+    free_simulation(simulation);
+    remove_session();
+    return 1;
+  }
+
+  print_log("ГОТОВО: сессия %s, координатор PID %ld, ожидаем %d философов.\n"
+            "Запускайте philosophers_participant %s ID, номера 1..%d.\n",
+            name, (long)getpid(), parameters->count, name, parameters->count);
+  if (sem_post(mutex) == -1)
+  {
+    free_simulation(simulation);
+    remove_session();
+    return 1;
+  }
+
+  long long connected_at = monotonic_ms();
+  long long last_lock = connected_at;
+  long long stopping_at = -1;
+  long long next_snapshot = 0;
+  long long next_health_check = 0;
+  pid_t active[MAX_PHILOSOPHERS] = {0};
+  int emergency = connected_at < 0;
+
+  while (!emergency)
+  {
+    long long now = monotonic_ms();
+    int locked = wait_semaphore(mutex, 10);
+
+    if (now < 0 || locked == -1 || (locked == 1 && (received_signal() || now - last_lock >= 2000)))
+    {
+      emergency = 1;
+      break;
+    }
+    if (locked == 1)
+    {
+      continue;
+    }
+    last_lock = now;
+
+    int connected = 0;
+    int remaining = 0;
+    int failed = 0;
+    for (int i = 0; i < parameters->count; i++)
+    {
+      pid_t pid = simulation->participants[i];
+
+      if (pid > 0)
+      {
+        connected++;
+      }
+      if (pid > 0 && !simulation->departed[i])
+      {
+        active[i] = pid;
+      }
+      else
+      {
+        active[i] = 0;
+      }
+
+      int state = 0;
+      if (active[i] > 0 && now >= next_health_check)
+      {
+        state = participant_state(active[i]);
+      }
+
+      if (state == 1)
+      {
+        simulation->departed[i] = -1;
+        active[i] = 0;
+      }
+
+      if (active[i] > 0)
+      {
+        remaining++;
+      }
+
+      failed |= (simulation->departed[i] < 0);
+      failed |= (state == 2);
+    }
+    if (now >= next_health_check)
+    {
+      next_health_check = now + 100;
+    }
+    
+    if (failed)
+    {
+      stop_simulation(simulation, 1, "аварийное завершение независимого философа");
+    }
+    else if (received_signal() || output_failed())
+    {
+      stop_simulation(simulation, received_signal() ? 128 + received_signal() : 1,
+                      "прерывание координатора или ошибка вывода");
+    }
+    else if (!simulation->started && connected == parameters->count)
+    {
+      if (clock_gettime(CLOCK_MONOTONIC, &simulation->started_at) == -1)
+      {
+        stop_simulation(simulation, 1, "ошибка часов при старте");
+      }
+      else
+      {
+        simulation->started = 1;
+        print_log("Все %d независимых философов подключены. Старт моделирования.\n",
+                  parameters->count);
+
+        for (int i = 0; i < parameters->count; i++)
+        {
+          if (sem_post(wake[i]) == -1)
+          {
+            stop_simulation(simulation, 1, "ошибка sem_post при старте");
+          }
+        }
+      }
+    }
+    else if (!simulation->started && now - connected_at >= 10000)
+    {
+      stop_simulation(simulation, 1, "не все философы подключились за 10 секунд");
+    }
+
+    if (simulation->started)
+    {
+      check_stop(simulation);
+      if (!simulation->stopped && parameters->display_delay > 0 &&
+          simulation->now_ms >= next_snapshot)
+      {
+        print_snapshot(simulation, parameters->count);
+        next_snapshot = simulation->now_ms + parameters->display_delay;
+      }
+    }
+
+    int stopped = simulation->stopped;
+    int expired = 0;
+    if (stopped)
+    {
+      if (stopping_at < 0)
+      {
+        stopping_at = now;
+      }
+      expired = now - stopping_at >= 1000;
+    }
+
+    if (sem_post(mutex) == -1)
+    {
+      emergency = 1;
+      break;
+    }
+    if (stopped && remaining == 0)
+    {
+      break;
+    }
+    if (expired)
+    {
+      emergency = 1;
+      break;
+    }
+    pause_display(5);
+  }
+
+  int result = 1;
+  if (emergency)
+  {
+    dprintf(STDERR_FILENO, "Ошибка: участник не отвечает или удерживает mutex; останавливаем сессию.\n");
+    for (int i = 0; i < parameters->count; i++)
+    {
+      if (active[i] > 0)
+      {
+        kill(active[i], SIGKILL);
+      }
+    }
+    result = received_signal() ? 128 + received_signal() : 1;
+  }
+  else if (wait_semaphore(mutex, 100) == 0)
+  {
+    print_log("\n=== Итоги моделирования ===\nПричина завершения: %s.\n", simulation->reason);
+    stop_philosophers(simulation, parameters->count);
+    print_snapshot(simulation, parameters->count);
+    print_statistics(simulation, parameters);
+
+    result = output_failed() ? 1 : simulation->result;
+    if (sem_post(mutex) == -1)
+    {
+      result = 1;
+    }
+  }
+
+  if (free_simulation(simulation) == -1)
+  {
+    result = 1;
+  }
+  if (remove_session() == -1)
+  {
+    result = 1;
+  }
+  return result;
+}
+
+int run_participant(const char *name, int id)
+{
+  char path[80];
+  snprintf(path, sizeof(path), "/philosophers-session-%s", name);
+  int fd = shm_open(path, O_RDWR, 0);
+  if (fd == -1)
+  {
+    dprintf(STDERR_FILENO, "Ошибка подключения к сессии: %s\n", strerror(errno));
+    return 1;
+  }
+
+  struct stat info;
+  if (fstat(fd, &info) == -1 || info.st_size != (off_t)sizeof(Simulation))
+  {
+    dprintf(STDERR_FILENO, "Ошибка: shared memory сессии ещё не готова или имеет другой формат.\n");
+    close(fd);
+    return 1;
+  }
+
+  Simulation *simulation = mmap(NULL, sizeof(*simulation), PROT_READ | PROT_WRITE,
+                                MAP_SHARED, fd, 0);
+  close(fd);
+  if (simulation == MAP_FAILED)
+  {
+    dprintf(STDERR_FILENO, "Ошибка mmap сессии: %s\n", strerror(errno));
+    return 1;
+  }
+
+  configure_session_semaphores(name, 0);
+  mutex = open_semaphore(NULL, "mutex", 0);
+  int opened = 0;
+  int result = 1;
+  int registered = 0;
+
+  if (mutex == NULL || wait_semaphore(mutex, 2000) != 0)
+  {
+    dprintf(STDERR_FILENO, "Ошибка: семафор сессии недоступен.\n");
+    goto cleanup;
+  }
+
+  int count = simulation->parameters.count;
+  if (count < 2 || count > MAX_PHILOSOPHERS || id >= count ||
+      simulation->participants[id] || simulation->started || simulation->stopped ||
+      !coordinator_alive(simulation) ||
+      memchr(simulation->log_path, '\0', sizeof(simulation->log_path)) == NULL)
+  {
+    dprintf(STDERR_FILENO, "Ошибка: номер занят, вне диапазона или сессия закрыта.\n");
+    sem_post(mutex);
+    goto cleanup;
+  }
+
+  for (int i = 0; i < count; i++)
+  {
+    char semaphore_name[32];
+    snprintf(semaphore_name, sizeof(semaphore_name), "wake-%d", i);
+    wake[i] = open_semaphore(NULL, semaphore_name, 0);
+    if (wake[i] == NULL)
+    {
+      dprintf(STDERR_FILENO, "Ошибка открытия семафора философа: %s\n", strerror(errno));
+      sem_post(mutex);
+      goto cleanup;
+    }
+    opened++;
+  }
+
+  if (attach_console_log(simulation->log_path, 0) == -1)
+  {
+    dprintf(STDERR_FILENO, "Ошибка подключения журнала сессии: %s\n", strerror(errno));
+    sem_post(mutex);
+    goto cleanup;
+  }
+
+  simulation->participants[id] = getpid();
+  registered = 1;
+  print_log("Подключён независимый философ %d: PID %ld.\n", id + 1, (long)getpid());
+  if (sem_post(mutex) == -1)
+  {
+    goto cleanup;
+  }
+
+  result = philosopher_main(simulation, id);
+  
+  if (lock_simulation(simulation) == 0)
+  {
+    simulation->departed[id] = result == 0 ? 1 : -1;
+    result = result == 0 ? simulation->result : 1;
+    if (sem_post(mutex) == -1)
+    {
+      result = 1;
+    }
+  }
+  else
+  {
+    result = received_signal() ? 128 + received_signal() : 1;
+  }
+
+cleanup:
+  if (registered && received_signal())
+  {
+    result = 128 + received_signal();
+  }
+  for (int i = 0; i < opened; i++)
+  {
+    if (close_semaphore(wake[i]) == -1)
+    {
+      result = 1;
+    }
+  }
+  if (mutex != NULL && close_semaphore(mutex) == -1)
+  {
+    result = 1;
+  }
+  if (munmap(simulation, sizeof(*simulation)) == -1)
+  {
+    result = 1;
+  }
+  return result;
+}
+#endif

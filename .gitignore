@@ -2,5 +2,13 @@
 /bin/
 /build/
 *.log
+!tests/named_normal.log
+!tests/named_wait_timeout.log
+!tests/named_time_limit.log
+!tests/named_parallel.log
+!tests/session_normal.log
+!tests/session_wait_timeout.log
+!tests/session_time_limit.log
+!tests/session_parallel.log
 __pycache__/
 style/

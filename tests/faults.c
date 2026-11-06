@@ -1,8 +1,9 @@
-/* Подмены подключаются линкером только к тестовой программе philosophers_faults. */
+/* Подмены подключаются линкером только к тестовой программе philosophers_faults */
 #include <errno.h>
 #include <fcntl.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -59,6 +60,54 @@ int __wrap_sem_init(sem_t *semaphore, int shared, unsigned int value)
     return -1;
   }
   return __real_sem_init(semaphore, shared, value);
+}
+
+sem_t *__real_sem_open(const char *name, int flags, ...);
+sem_t *__wrap_sem_open(const char *name, int flags, ...)
+{
+  static int calls = 0;
+  calls++;
+  if (selected("sem_open") || (selected("mutex") && calls == 1) ||
+      (selected("semaphore") && calls == 3))
+  {
+    errno = EACCES;
+    return SEM_FAILED;
+  }
+  if (!(flags & O_CREAT))
+  {
+    return __real_sem_open(name, flags);
+  }
+  va_list arguments;
+  va_start(arguments, flags);
+  mode_t mode = va_arg(arguments, mode_t);
+  unsigned int value = va_arg(arguments, unsigned int);
+  va_end(arguments);
+  return __real_sem_open(name, flags, mode, value);
+}
+
+int __real_sem_unlink(const char *name);
+int __wrap_sem_unlink(const char *name)
+{
+  static int calls = 0;
+  if (selected("sem_unlink") && ++calls == 1)
+  {
+    errno = EIO;
+    return -1;
+  }
+  return __real_sem_unlink(name);
+}
+
+int __real_sem_close(sem_t *semaphore);
+int __wrap_sem_close(sem_t *semaphore)
+{
+  static int calls = 0;
+  int result = __real_sem_close(semaphore);
+  if (selected("sem_close") && ++calls == 1 && result == 0)
+  {
+    errno = EIO;
+    return -1;
+  }
+  return result;
 }
 
 pid_t __real_fork(void);

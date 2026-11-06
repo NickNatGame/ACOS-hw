@@ -40,6 +40,13 @@ foreach(role coordinator participant)
 endforeach()
 target_compile_definitions(philosophers_coordinator PRIVATE COORDINATOR_MAIN)
 
+foreach(role coordinator participant)
+    add_executable(philosophers_mq_${role} src/mq/mq_main.c src/mq/mq_${role}.c
+        src/mq/mq_ipc.c src/common/session_name.c src/common/parameters.c src/common/console.c)
+    configure_philosophers(philosophers_mq_${role})
+endforeach()
+target_compile_definitions(philosophers_mq_coordinator PRIVATE MQ_COORDINATOR_MAIN)
+
 # Сохраняем прежнюю команду запуска неименованной версии
 add_custom_command(TARGET philosophers_unnamed POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -49,6 +56,16 @@ add_custom_target(philosophers DEPENDS philosophers_unnamed)
 
 include(CTest)
 if(BUILD_TESTING)
+    foreach(role coordinator participant)
+        add_executable(philosophers_mq_${role}_faults src/mq/mq_main.c src/mq/mq_${role}.c
+            src/mq/mq_ipc.c src/common/session_name.c src/common/parameters.c src/common/console.c
+            tests/mq_faults.c)
+        configure_philosophers(philosophers_mq_${role}_faults)
+        target_link_options(philosophers_mq_${role}_faults PRIVATE
+            -Wl,--wrap=mq_open,--wrap=mq_timedsend,--wrap=mq_timedreceive
+            -Wl,--wrap=sem_open,--wrap=sem_post,--wrap=clock_gettime)
+    endforeach()
+    target_compile_definitions(philosophers_mq_coordinator_faults PRIVATE MQ_COORDINATOR_MAIN)
     foreach(kind unnamed named)
         if(kind STREQUAL "unnamed")
             set(fault_target philosophers_faults)
@@ -91,4 +108,15 @@ if(BUILD_TESTING)
         COMMAND philosophers_session_tests $<TARGET_FILE:philosophers_coordinator>
             $<TARGET_FILE:philosophers_participant>)
     set_tests_properties(philosophers_session_tests PROPERTIES TIMEOUT 90)
+    add_executable(philosophers_mq_tests tests/test_session.c src/mq/mq_ipc.c)
+    configure_philosophers(philosophers_mq_tests)
+    target_compile_definitions(philosophers_mq_tests PRIVATE MQ_TESTS)
+    add_dependencies(philosophers_mq_tests philosophers_mq_coordinator philosophers_mq_participant
+        philosophers_mq_coordinator_faults philosophers_mq_participant_faults)
+    add_test(NAME philosophers_mq_tests
+        COMMAND philosophers_mq_tests $<TARGET_FILE:philosophers_mq_coordinator>
+            $<TARGET_FILE:philosophers_mq_participant>
+            $<TARGET_FILE:philosophers_mq_coordinator_faults>
+            $<TARGET_FILE:philosophers_mq_participant_faults>)
+    set_tests_properties(philosophers_mq_tests PROPERTIES TIMEOUT 90)
 endif()

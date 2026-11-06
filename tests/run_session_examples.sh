@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Координатор и философы запускаются оболочкой как независимые процессы.
-if [ "$#" -ne 0 ] || [ ! -x ./bin/philosophers_coordinator ] ||
-   [ ! -x ./bin/philosophers_participant ]; then
-  echo "Соберите проект и запустите bash tests/run_session_examples.sh из его корня." >&2
+kind=${1:-session}
+binary_prefix=philosophers_
+log_prefix=philosophers-
+if [ "$kind" = "mq" ]; then
+  binary_prefix=philosophers_mq_
+  log_prefix=philosophers-mq-
+fi
+if [ "$#" -gt 1 ] || { [ "$kind" != "session" ] && [ "$kind" != "mq" ]; } ||
+   [ ! -x "./bin/${binary_prefix}coordinator" ] ||
+   [ ! -x "./bin/${binary_prefix}participant" ]; then
+  echo "Соберите проект и запустите bash tests/run_session_examples.sh [session|mq] из его корня." >&2
   exit 1
 fi
 root=$(pwd)
@@ -32,7 +40,7 @@ while read -r name expected parameters; do
   session="example_$$_$name"
   (
     cd "$work_dir" || exit 1
-    exec "$root/bin/philosophers_coordinator" "$session" "${arguments[@]}"
+    exec "$root/bin/${binary_prefix}coordinator" "$session" "${arguments[@]}"
   ) > "$work_dir/$name.out" 2> "$work_dir/$name.err" &
   coordinator_pid=$!
   ready=0
@@ -49,7 +57,7 @@ while read -r name expected parameters; do
   fi
   participants=()
   for ((id=1; id<=arguments[0]; id++)); do
-    "$root/bin/philosophers_participant" "$session" "$id" \
+    "$root/bin/${binary_prefix}participant" "$session" "$id" \
       > "$work_dir/$name-$id.out" 2> "$work_dir/$name-$id.err" &
     participants+=("$!")
   done
@@ -69,6 +77,6 @@ while read -r name expected parameters; do
     echo "FAIL: $name, код $result вместо $expected; диагностика в $work_dir" >&2
     exit 1
   fi
-  cp "$work_dir/philosophers-$session.log" "$root/tests/session_$name.log" || exit 1
-  echo "OK: session/$name, код $result, журнал tests/session_$name.log"
+  cp "$work_dir/$log_prefix$session.log" "$root/tests/${kind}_$name.log" || exit 1
+  echo "OK: $kind/$name, код $result, журнал tests/${kind}_$name.log"
 done < tests/scenarios.txt

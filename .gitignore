@@ -10,5 +10,9 @@
 !tests/session_wait_timeout.log
 !tests/session_time_limit.log
 !tests/session_parallel.log
+!tests/mq_normal.log
+!tests/mq_wait_timeout.log
+!tests/mq_time_limit.log
+!tests/mq_parallel.log
 __pycache__/
 style/

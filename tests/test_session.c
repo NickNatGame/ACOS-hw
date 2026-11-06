@@ -1,4 +1,14 @@
 #include "soft_assert.h"
+#ifdef MQ_TESTS
+#include "mq_philosophers.h"
+#define LOG_PREFIX "philosophers-mq-"
+#define IPC_PREFIX "/philosophers-mq-"
+#define SEM_PREFIX "sem.philosophers-mq-"
+#else
+#define LOG_PREFIX "philosophers-"
+#define IPC_PREFIX "/philosophers-session-"
+#define SEM_PREFIX "sem.philosophers-session-"
+#endif
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -103,7 +113,7 @@ static pid_t start_coordinator(const char *name, int count, int slow, int limit)
       slow ? "20" : "5", slow == 2 ? "1" : "2000", "0", "42", "fifo", time_limit, NULL};
   pid_t pid = launch(arguments, 0);
   char log[100];
-  snprintf(log, sizeof(log), "philosophers-%s.log", name);
+  snprintf(log, sizeof(log), LOG_PREFIX "%s.log", name);
   int ready = 0;
   for (int i = 0; i < 400; i++)
   {
@@ -127,6 +137,18 @@ static pid_t start_participant(const char *name, const char *id)
 static void check_cleanup(const char *name)
 {
   char path[100];
+#ifdef MQ_TESTS
+  for (int i = -1; i < MAX_PHILOSOPHERS; i++)
+  {
+    mq_resource_name(path, name, i < 0 ? "requests" : "reply", i);
+    mqd_t queue = mq_open(path, O_RDONLY | O_NONBLOCK);
+    SOFT_ASSERT_ERR(queue == (mqd_t)-1 && errno == ENOENT);
+    if (queue != (mqd_t)-1)
+    {
+      mq_close(queue);
+    }
+  }
+#endif
   snprintf(path, sizeof(path), "/philosophers-session-%s", name);
   int fd = shm_open(path, O_RDWR, 0);
   SOFT_ASSERT_ERR(fd == -1 && errno == ENOENT);
@@ -140,7 +162,7 @@ static void check_cleanup(const char *name)
   {
     return;
   }
-  snprintf(path, sizeof(path), "sem.philosophers-session-%s-", name);
+  snprintf(path, sizeof(path), SEM_PREFIX "%s-", name);
   struct dirent *entry;
   while ((entry = readdir(directory)) != NULL)
   {
@@ -167,7 +189,7 @@ static void check_no_children(pid_t pid)
 static void check_events(const char *name, int count)
 {
   char path[100], line[4096];
-  snprintf(path, sizeof(path), "philosophers-%s.log", name);
+  snprintf(path, sizeof(path), LOG_PREFIX "%s.log", name);
   FILE *file = fopen(path, "r");
   SOFT_ASSERT_ERR(file != NULL);
   if (!file)
@@ -175,6 +197,7 @@ static void check_events(const char *name, int count)
     return;
   }
   int owners[256], queue[1024], head = 0, tail = 0, meals = 0;
+  long long deadlines[256] = {0};
   for (int i = 0; i < count; i++)
   {
     owners[i] = -1;
@@ -194,11 +217,25 @@ static void check_events(const char *name, int count)
     }
     if (strstr(line, "проголодался"))
     {
+      SOFT_ASSERT_ERR(time >= deadlines[id - 1]);
       SOFT_ASSERT_ERR(tail < 1024);
       if (tail < 1024)
       {
         queue[tail++] = id;
       }
+    }
+    int duration;
+    long long waited;
+    if (sscanf(line, "[%lld ms] Философ %d: начал размышление на %d ms",
+               &time, &id, &duration) == 3 ||
+        sscanf(line, "[%lld ms] Философ %d: начал есть после ожидания %lld ms на %d ms",
+               &time, &id, &waited, &duration) == 4)
+    {
+      deadlines[id - 1] = time + duration;
+    }
+    if (strstr(line, "закончил есть"))
+    {
+      SOFT_ASSERT_ERR(time >= deadlines[id - 1]);
     }
     if (strstr(line, "получил левую"))
     {
@@ -263,7 +300,7 @@ static void test_duplicates(void)
   SOFT_ASSERT_ERR(finish(launch(duplicate, 0)) == 1);
   pid_t first = start_participant(name, "1");
   char log[100];
-  snprintf(log, sizeof(log), "philosophers-%s.log", name);
+  snprintf(log, sizeof(log), LOG_PREFIX "%s.log", name);
   for (int i = 0; i < 400 && !contains(log, "философ 1:"); i++)
   {
     pause_test();
@@ -287,7 +324,7 @@ static void test_stop(int target, int number)
   pid_t first = start_participant(name, "1");
   pid_t second = start_participant(name, "2");
   char log[100];
-  snprintf(log, sizeof(log), "philosophers-%s.log", name);
+  snprintf(log, sizeof(log), LOG_PREFIX "%s.log", name);
   for (int i = 0; i < 400 && !contains(log, "Старт моделирования"); i++)
   {
     pause_test();
@@ -328,7 +365,7 @@ static void test_foreign_semaphore(void)
 {
   char name[64], path[100];
   new_session(name);
-  snprintf(path, sizeof(path), "/philosophers-session-%s-wake-1", name);
+  snprintf(path, sizeof(path), IPC_PREFIX "%s-wake-1", name);
   sem_t *foreign = sem_open(path, O_CREAT | O_EXCL, 0600, 7);
   SOFT_ASSERT_ERR(foreign != SEM_FAILED);
   if (foreign == SEM_FAILED)
@@ -360,6 +397,28 @@ static void test_limits(int wait_limit)
   SOFT_ASSERT_ERR(finish(first) == 2);
   SOFT_ASSERT_ERR(finish(second) == 2);
   SOFT_ASSERT_ERR(finish(parent) == 2);
+  char path[100], line[4096];
+  snprintf(path, sizeof(path), LOG_PREFIX "%s.log", name);
+  FILE *file = fopen(path, "r");
+  SOFT_ASSERT_ERR(file != NULL);
+  if (file)
+  {
+    int interrupted_wait = 0;
+    while (fgets(line, sizeof(line), file))
+    {
+      int id, done, cycles, meals;
+      long long total, pending, maximum;
+      if (sscanf(line, "P%d: циклов=%d/%d, начато приёмов пищи=%d, ожидание перед начатой едой=%lld ms, "
+                 "незавершённое ожидание=%lld ms, максимум=%lld ms",
+                 &id, &done, &cycles, &meals, &total, &pending, &maximum) == 7)
+      {
+        SOFT_ASSERT_ERR(maximum >= pending);
+        interrupted_wait |= pending > 0;
+      }
+    }
+    SOFT_ASSERT_ERR(!wait_limit || interrupted_wait);
+    fclose(file);
+  }
   check_cleanup(name);
 }
 
@@ -387,6 +446,7 @@ static void test_parallel(void)
   }
 }
 
+#ifndef MQ_TESTS
 static void test_foreign_memory(void)
 {
   char name[64], path[100];
@@ -414,6 +474,166 @@ static void test_foreign_memory(void)
   shm_unlink(path);
   check_cleanup(name);
 }
+#else
+static void test_foreign_queue(void)
+{
+  char name[64], path[96];
+  new_session(name);
+  mq_resource_name(path, name, "reply", 1);
+  struct mq_attr attributes = {.mq_maxmsg = 1, .mq_msgsize = 1};
+  mqd_t queue = mq_open(path, O_CREAT | O_EXCL | O_RDWR, 0600, &attributes);
+  SOFT_ASSERT_ERR(queue != (mqd_t)-1);
+  if (queue == (mqd_t)-1)
+  {
+    return;
+  }
+  SOFT_ASSERT_ERR(mq_send(queue, "x", 1, 0) == 0);
+  char *arguments[] = {(char *)coordinator, name, "2", NULL};
+  SOFT_ASSERT_ERR(finish(launch(arguments, 0)) == 1);
+  mqd_t reopened = mq_open(path, O_RDONLY | O_NONBLOCK);
+  SOFT_ASSERT_ERR(reopened != (mqd_t)-1);
+  if (reopened != (mqd_t)-1)
+  {
+    char value;
+    SOFT_ASSERT_ERR(mq_receive(reopened, &value, 1, NULL) == 1 && value == 'x');
+    mq_close(reopened);
+  }
+  mq_close(queue);
+  mq_unlink(path);
+  check_cleanup(name);
+}
+
+static void test_invalid_messages(void)
+{
+  for (int bad = 0; bad < 4; bad++)
+  {
+    char name[64], path[96];
+    new_session(name);
+    pid_t parent = start_coordinator(name, 2, 0, 3000);
+    mq_resource_name(path, name, "requests", -1);
+    mqd_t queue = mq_open(path, O_WRONLY);
+    SOFT_ASSERT_ERR(queue != (mqd_t)-1);
+    if (queue != (mqd_t)-1)
+    {
+      MqMessage message = {.version = MQ_PROTOCOL_VERSION, .type = MQ_HUNGRY,
+          .id = 0, .pid = getpid()};
+      if (bad == 1)
+      {
+        message.version++;
+      }
+      if (bad == 2)
+      {
+        message.id = MAX_PHILOSOPHERS;
+      }
+      SOFT_ASSERT_ERR(mq_send(queue, (char *)&message, bad == 0 ? 1 : sizeof(message), 0) == 0);
+      mq_close(queue);
+    }
+    SOFT_ASSERT_ERR(finish(parent) == 1);
+    check_cleanup(name);
+  }
+}
+
+static void test_bounded_queue(void)
+{
+  char name[64], path[96];
+  new_session(name);
+  MqResources resources;
+  int created = mq_create_resources(&resources, name, 2);
+  SOFT_ASSERT_ERR(created == 0);
+  if (created == 0)
+  {
+    mq_resource_name(path, name, "requests", -1);
+    mqd_t writer = mq_open(path, O_WRONLY);
+    SOFT_ASSERT_ERR(writer != (mqd_t)-1);
+    if (writer != (mqd_t)-1)
+    {
+      MqMessage message = {.version = MQ_PROTOCOL_VERSION};
+      for (int i = 0; i < 4; i++)
+      {
+        message.value = i;
+        SOFT_ASSERT_ERR(mq_send_message(writer, &message, 20) == 0);
+      }
+      long long before = mq_now_ms();
+      SOFT_ASSERT_ERR(mq_send_message(writer, &message, 25) == 1);
+      SOFT_ASSERT_ERR(mq_now_ms() - before >= 20);
+      for (int i = 0; i < 4; i++)
+      {
+        SOFT_ASSERT_ERR(mq_receive_message(resources.requests, &message, 20) == 0);
+        SOFT_ASSERT_ERR(message.value == i);
+      }
+      SOFT_ASSERT_ERR(mq_receive_message(resources.requests, &message, 10) == 1);
+      SOFT_ASSERT_ERR(mq_wait_notice(resources.wake[0], 10) == 1);
+      message.type = MQ_THINK;
+      SOFT_ASSERT_ERR(mq_send_message(writer, &message, 20) == 0);
+      message.type = MQ_STOP;
+      SOFT_ASSERT_ERR(mq_send_message(writer, &message, 20) == 0);
+      SOFT_ASSERT_ERR(mq_receive_message(resources.requests, &message, 20) == 0 && message.type == MQ_STOP);
+      SOFT_ASSERT_ERR(mq_receive_message(resources.requests, &message, 20) == 0 && message.type == MQ_THINK);
+      mq_close(writer);
+    }
+  }
+  SOFT_ASSERT_ERR(mq_close_resources(&resources) == 0);
+  check_cleanup(name);
+}
+
+static void test_mq_failures(const char *fault_coordinator, const char *fault_participant)
+{
+  const char *failures[] = {"mq_open", "mq_partial", "sem_open", "clock", "mq_receive"};
+  for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++)
+  {
+    char name[64];
+    new_session(name);
+    SOFT_ASSERT_ERR(setenv("PHILOSOPHERS_MQ_FAILURE", failures[i], 1) == 0);
+    char *arguments[] = {(char *)fault_coordinator, name, "2", NULL};
+    SOFT_ASSERT_ERR(finish(launch(arguments, 0)) == 1);
+    unsetenv("PHILOSOPHERS_MQ_FAILURE");
+    check_cleanup(name);
+  }
+  const char *running_failures[] = {"mq_send", "sem_post"};
+  for (size_t i = 0; i < sizeof(running_failures) / sizeof(running_failures[0]); i++)
+  {
+    char name[64];
+    new_session(name);
+    const char *normal = coordinator;
+    coordinator = fault_coordinator;
+    SOFT_ASSERT_ERR(setenv("PHILOSOPHERS_MQ_FAILURE", running_failures[i], 1) == 0);
+    pid_t parent = start_coordinator(name, 2, 0, 3000);
+    unsetenv("PHILOSOPHERS_MQ_FAILURE");
+    coordinator = normal;
+    pid_t first = start_participant(name, "1");
+    SOFT_ASSERT_ERR(finish(first) == 1);
+    SOFT_ASSERT_ERR(finish(parent) == 1);
+    check_cleanup(name);
+  }
+  char name[64];
+  new_session(name);
+  pid_t parent = start_coordinator(name, 2, 0, 3000);
+  const char *normal = participant;
+  participant = fault_participant;
+  SOFT_ASSERT_ERR(setenv("PHILOSOPHERS_MQ_FAILURE", "mq_send", 1) == 0);
+  SOFT_ASSERT_ERR(finish(start_participant(name, "1")) == 1);
+  unsetenv("PHILOSOPHERS_MQ_FAILURE");
+  participant = normal;
+  SOFT_ASSERT_ERR(kill(parent, SIGINT) == 0);
+  SOFT_ASSERT_ERR(finish(parent) == 130);
+  check_cleanup(name);
+}
+
+static void test_mq_log_failure(void)
+{
+  for (int full = 0; full < 2; full++)
+  {
+    char name[64], path[100];
+    new_session(name);
+    snprintf(path, sizeof(path), LOG_PREFIX "%s.log", name);
+    SOFT_ASSERT_ERR(full ? symlink("/dev/full", path) == 0 : mkdir(path, 0700) == 0);
+    char *arguments[] = {(char *)coordinator, name, "2", NULL};
+    SOFT_ASSERT_ERR(finish(launch(arguments, 0)) == 1);
+    SOFT_ASSERT_ERR(full ? unlink(path) == 0 : rmdir(path) == 0);
+    check_cleanup(name);
+  }
+}
+#endif
 
 static void test_invalid_input(void)
 {
@@ -440,7 +660,11 @@ static void test_invalid_input(void)
 
 int main(int argc, char **argv)
 {
-  if (argc != 3)
+  if (argc != 3
+#ifdef MQ_TESTS
+      && argc != 5
+#endif
+      )
   {
     return 1;
   }
@@ -466,7 +690,18 @@ int main(int argc, char **argv)
   test_limits(0);
   test_limits(1);
   test_parallel();
+#ifdef MQ_TESTS
+  test_foreign_queue();
+  test_invalid_messages();
+  test_bounded_queue();
+  test_mq_log_failure();
+  if (argc == 5)
+  {
+    test_mq_failures(argv[3], argv[4]);
+  }
+#else
   test_foreign_memory();
+#endif
   printf("%s: independent session tests; logs: %s\n", fl_err ? "FAILED" : "OK", directory);
   return fl_err ? 1 : 0;
 }

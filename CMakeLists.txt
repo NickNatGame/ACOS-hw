@@ -9,15 +9,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Threads REQUIRED)
 
 set(PHILOSOPHERS_SOURCES
-    src/philosophers.c
-    src/parameters.c
-    src/simulation.c
-    src/console.c
+    src/fork_shared/philosophers.c
+    src/common/parameters.c
+    src/fork_shared/simulation.c
+    src/common/console.c
 )
 
 function(configure_philosophers target)
     target_link_libraries(${target} PRIVATE Threads::Threads rt)
-    target_include_directories(${target} PRIVATE inc)
+    target_include_directories(${target} PRIVATE inc/common inc/fork_shared inc/mq)
     target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     set_target_properties(${target} PROPERTIES
@@ -26,13 +26,15 @@ function(configure_philosophers target)
 endfunction()
 
 foreach(kind unnamed named)
-    add_executable(philosophers_${kind} ${PHILOSOPHERS_SOURCES} src/semaphores_${kind}.c)
+    add_executable(philosophers_${kind} ${PHILOSOPHERS_SOURCES}
+        src/fork_shared/semaphores_${kind}.c)
     configure_philosophers(philosophers_${kind})
 endforeach()
 
 foreach(role coordinator participant)
-    add_executable(philosophers_${role} src/independent.c src/parameters.c
-        src/simulation.c src/console.c src/semaphores_session.c)
+    add_executable(philosophers_${role} src/independent/independent.c src/common/parameters.c
+        src/fork_shared/simulation.c src/common/console.c
+        src/independent/semaphores_session.c src/common/session_name.c)
     configure_philosophers(philosophers_${role})
     target_compile_definitions(philosophers_${role} PRIVATE INDEPENDENT_PROCESSES)
 endforeach()
@@ -54,7 +56,7 @@ if(BUILD_TESTING)
             set(fault_target philosophers_named_faults)
         endif()
         add_executable(${fault_target} ${PHILOSOPHERS_SOURCES}
-            src/semaphores_${kind}.c tests/faults.c)
+            src/fork_shared/semaphores_${kind}.c tests/faults.c)
         configure_philosophers(${fault_target})
         target_link_options(${fault_target} PRIVATE
             -Wl,--wrap=shm_open,--wrap=posix_fallocate,--wrap=mmap,--wrap=sem_init
@@ -64,11 +66,11 @@ if(BUILD_TESTING)
     endforeach()
     add_executable(philosophers_tests
         tests/test_philosophers.c
-        src/parameters.c
+        src/common/parameters.c
     )
     add_dependencies(philosophers_tests philosophers_unnamed philosophers_named
         philosophers_faults philosophers_named_faults)
-    target_include_directories(philosophers_tests PRIVATE inc)
+    target_include_directories(philosophers_tests PRIVATE inc/common inc/fork_shared inc/mq)
     target_compile_definitions(philosophers_tests PRIVATE _POSIX_C_SOURCE=200809L)
     target_compile_options(philosophers_tests PRIVATE -Wall -Wextra -Wpedantic)
     set_target_properties(philosophers_tests PROPERTIES

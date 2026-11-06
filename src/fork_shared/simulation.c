@@ -985,7 +985,7 @@ static int participant_state(pid_t pid)
     if (fgets(line, sizeof(line), file))
     {
       char *end = strrchr(line, ')');
-      if (end && end[1] == ' ' & &end[2])
+      if (end && end[1] == ' ' && end[2])
       {
         if (end[2] == 'Z' || end[2] == 'X')
         {

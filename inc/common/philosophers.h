@@ -1,7 +1,7 @@
 #ifndef PHILOSOPHERS_H
 #define PHILOSOPHERS_H
 
-/* Ограничиваем число участников до создания процессов и общей памяти */
+/* Ограничиваем число участников до запуска сервера */
 #define MAX_PHILOSOPHERS 256
 
 typedef struct {
@@ -19,8 +19,5 @@ typedef struct {
 
 /* 1 - параметры прочитаны, 0 - справка, -1 - ошибка */
 int read_parameters(int argc, char **argv, Parameters *parameters);
-
-/* 0 - успех, 1 - ошибка, 2 - лимит, 130/143 - SIGINT/SIGTERM */
-int run_simulation(const Parameters *parameters);
 
 #endif

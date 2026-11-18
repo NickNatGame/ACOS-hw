@@ -10,8 +10,8 @@
     do {                                                                  \
         if (!(cond)) {                                                    \
             int saved_errno = errno;                                      \
-            dprintf(STDERR_FILENO, "FAIL %s:%d: %s\n",                      \
-                    __FILE__, __LINE__, #cond);                            \
+            dprintf(STDERR_FILENO, "FAIL %s:%d: %s\n",                   \
+                    __FILE__, __LINE__, #cond);                           \
             errno = saved_errno;                                          \
             fl_err++;                                                     \
         }                                                                 \

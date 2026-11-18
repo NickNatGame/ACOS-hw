@@ -15,7 +15,9 @@ enum
   TCP_EAT,
   TCP_FINISH,
   TCP_CONTINUE,
-  TCP_STOP
+  TCP_STOP,
+  TCP_OBSERVER_JOIN,
+  TCP_SNAPSHOT
 };
 
 /* Шесть uint32_t в сетевом порядке: версия, тип, ID (1..N), значение, N, циклы */
@@ -42,5 +44,6 @@ int tcp_send(int fd, int type, int id, int value, int count, int cycles);
 int tcp_receive(TcpPeer *peer, TcpMessage *message);
 int run_tcp_server(const struct sockaddr_in *address, const Parameters *parameters);
 int run_tcp_client(const struct sockaddr_in *address, int id);
+int run_tcp_observer(const struct sockaddr_in *address);
 
 #endif

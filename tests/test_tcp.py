@@ -11,9 +11,9 @@ import tempfile
 import time
 import unittest
 
-SERVER, CLIENT = map(lambda p: str(pathlib.Path(p).resolve()), sys.argv[1:3])
-del sys.argv[1:3]
-JOIN, CONFIG, START, HUNGRY, EAT, FINISH, CONTINUE, STOP = range(1, 9)
+SERVER, CLIENT, OBSERVER = map(lambda p: str(pathlib.Path(p).resolve()), sys.argv[1:4])
+del sys.argv[1:4]
+JOIN, CONFIG, START, HUNGRY, EAT, FINISH, CONTINUE, STOP, OBSERVER_JOIN, SNAPSHOT = range(1, 11)
 
 
 def packet(kind, identity, value=0):
@@ -144,6 +144,27 @@ class TcpTests(unittest.TestCase):
         self.codes([duplicate], 1)
         clients.append(self.launch([CLIENT, "127.0.0.1", self.port, "2"]))
         self.codes([(server, output)] + clients, 0)
+
+    def test_observer_receives_complete_state(self):
+        server, output = self.server(count=2, cycles=1, eat=30)
+        observer = self.launch([OBSERVER, "127.0.0.1", self.port])
+        clients = self.clients(2)
+        self.codes([(server, output)] + clients + [observer], 0)
+        text = self.text(observer[1])
+        self.assertIn("Наблюдатель: подключён", text)
+        self.assertIn("P1=", text)
+        self.assertIn("F1=", text)
+
+    def test_observer_can_join_running_model(self):
+        server, output = self.server(count=2, cycles=1, think=100)
+        clients = self.clients(2)
+        deadline = time.monotonic() + 3
+        while "начал размышление" not in self.text(clients[0][1]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.005)
+        observer = self.launch([OBSERVER, "127.0.0.1", self.port])
+        self.codes([(server, output)] + clients + [observer], 0)
+        self.assertIn("Наблюдатель: подключён", self.text(observer[1]))
 
     def test_limits(self):
         for options in ({"think": 500, "limit": 30}, {"eat": 500, "max_wait": 30}):

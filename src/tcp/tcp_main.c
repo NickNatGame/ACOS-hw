@@ -17,6 +17,8 @@ int main(int argc, char **argv)
                "На подключение всех N философов даётся 10 секунд.\n"
                "display_delay сохранён для совместимости; общих снимков в TCP-версии нет.\n",
             argv[0]);
+#elif defined(TCP_OBSERVER_MAIN)
+    dprintf(1, "Использование: %s SERVER_IPv4 PORT\n", argv[0]);
 #else
     dprintf(1, "Использование: %s SERVER_IPv4 PORT ID\nID: 1..N.\n", argv[0]);
 #endif
@@ -45,6 +47,12 @@ int main(int argc, char **argv)
   if (read_parameters(argc - 2, arguments, &parameters) != 1)
     return 1;
 
+#elif defined(TCP_OBSERVER_MAIN)
+  if (argc != 3)
+  {
+    dprintf(2, "Ошибка: нужны SERVER_IPv4 и PORT.\n");
+    return 1;
+  }
 #else
   if (argc != 4)
   {
@@ -66,6 +74,8 @@ int main(int argc, char **argv)
     return 1;
 #ifdef TCP_SERVER_MAIN
   int result = run_tcp_server(&address, &parameters);
+#elif defined(TCP_OBSERVER_MAIN)
+  int result = run_tcp_observer(&address);
 #else
   int result = run_tcp_client(&address, (int)id);
 #endif

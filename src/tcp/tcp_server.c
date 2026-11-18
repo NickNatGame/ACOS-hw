@@ -30,11 +30,28 @@ typedef struct
 typedef struct
 {
   Parameters p;
-  Client clients[MAX_PHILOSOPHERS];
+  Client clients[MAX_PHILOSOPHERS + 1];
+  TcpPeer observer;
   int forks[MAX_PHILOSOPHERS], queue[MAX_PHILOSOPHERS];
   int head, size, joined, finished, started;
   long long start;
 } Server;
+
+static void send_snapshot(Server *s)
+{
+  if (s->observer.fd < 0) return;
+  for (int i = 0; i < s->p.count; i++)
+  {
+    int right = (i + 1) % s->p.count;
+    if (tcp_send(s->observer.fd, TCP_SNAPSHOT, i + 1, s->clients[i].state,
+                 s->forks[i], s->forks[right]) < 0)
+    {
+      close(s->observer.fd);
+      s->observer.fd = -1;
+      return;
+    }
+  }
+}
 
 static int duration(int minimum, int maximum)
 {
@@ -83,6 +100,7 @@ static int give_forks(Server *s)
               c->id, left + 1, right + 1, now - c->hungry_since, delay);
     if (answer(c, TCP_EAT, delay) < 0)
       return 1;
+    send_snapshot(s);
   }
   return 0;
 }
@@ -103,6 +121,27 @@ static int limit_reached(const Server *s, long long now)
 static int handle(Server *s, int slot, const TcpMessage *m, long long now)
 {
   Client *c = &s->clients[slot];
+  if (!c->id && m->type == TCP_OBSERVER_JOIN)
+  {
+    if (m->id || m->value || m->count || m->cycles || s->observer.fd >= 0)
+    {
+      tcp_send(c->peer.fd, TCP_STOP, 0, 1, 0, 0);
+      close(c->peer.fd);
+      c->peer.fd = -1;
+      return 0;
+    }
+    s->observer = c->peer;
+    c->peer.fd = -1;
+    if (tcp_send(s->observer.fd, TCP_CONFIG, 0, 0, s->p.count, s->p.cycles) < 0)
+    {
+      close(s->observer.fd);
+      s->observer.fd = -1;
+      return 0;
+    }
+    print_log("Сервер: подключён наблюдатель.\n");
+    send_snapshot(s);
+    return 0;
+  }
   if (!c->id)
   {
     int duplicate = 0;
@@ -133,6 +172,7 @@ static int handle(Server *s, int slot, const TcpMessage *m, long long now)
       for (int i = 0; i < s->p.count; i++)
         if (think(s, &s->clients[i], TCP_START, now) < 0)
           return 1;
+      send_snapshot(s);
     }
     return 0;
   }
@@ -148,6 +188,7 @@ static int handle(Server *s, int slot, const TcpMessage *m, long long now)
     s->size++;
     print_log("Сервер: философ %d сообщил о голоде, запросил вилки %d и %d.\n",
               c->id, c->id, c->id % s->p.count + 1);
+    send_snapshot(s);
     return give_forks(s);
   }
 
@@ -164,6 +205,7 @@ static int handle(Server *s, int slot, const TcpMessage *m, long long now)
     }
     else if (think(s, c, TCP_CONTINUE, now) < 0)
       return 1;
+    send_snapshot(s);
 
 
     return give_forks(s);
@@ -174,7 +216,8 @@ static int handle(Server *s, int slot, const TcpMessage *m, long long now)
 int run_tcp_server(const struct sockaddr_in *address, const Parameters *parameters)
 {
   Server s = {.p = *parameters};
-  for (int i = 0; i < parameters->count; i++)
+  s.observer.fd = -1;
+  for (int i = 0; i <= parameters->count; i++)
     s.clients[i].peer.fd = -1;
 
   int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -234,11 +277,12 @@ int run_tcp_server(const struct sockaddr_in *address, const Parameters *paramete
       break;
     }
 
-    struct pollfd items[MAX_PHILOSOPHERS + 1] = {{.fd = listener, .events = POLLIN}};
-    for (int i = 0; i < parameters->count; i++)
-      items[i + 1] = (struct pollfd){.fd = s.clients[i].peer.fd, .events = POLLIN};
+    struct pollfd items[MAX_PHILOSOPHERS + 3] = {{.fd = listener, .events = POLLIN},
+                                                  {.fd = s.observer.fd, .events = POLLIN}};
+    for (int i = 0; i <= parameters->count; i++)
+      items[i + 2] = (struct pollfd){.fd = s.clients[i].peer.fd, .events = POLLIN};
     
-    if (poll(items, (nfds_t)parameters->count + 1, 10) < 0)
+    if (poll(items, (nfds_t)parameters->count + 3, 10) < 0)
     {
       if (errno == EINTR)
         continue;
@@ -253,13 +297,13 @@ int run_tcp_server(const struct sockaddr_in *address, const Parameters *paramete
       if (fd >= 0)
       {
         int slot = -1;
-        for (int i = 0; i < parameters->count; i++)
+        for (int i = 0; i <= parameters->count; i++)
           if (s.clients[i].peer.fd < 0)
           {
             slot = i;
             break;
           }
-        if (slot < 0 || s.started || tcp_nonblocking(fd) < 0)
+        if (slot < 0 || tcp_nonblocking(fd) < 0)
           close(fd);
         else
           s.clients[slot] = (Client){.peer = {.fd = fd}};
@@ -271,9 +315,18 @@ int run_tcp_server(const struct sockaddr_in *address, const Parameters *paramete
         break;
       }
     }
-    for (int i = 0; i < parameters->count; i++)
+    if (items[1].revents)
     {
-      if (!items[i + 1].revents)
+      TcpMessage message;
+      if (tcp_receive(&s.observer, &message) != 0)
+      {
+        close(s.observer.fd);
+        s.observer.fd = -1;
+      }
+    }
+    for (int i = 0; i <= parameters->count; i++)
+    {
+      if (!items[i + 2].revents)
         continue;
       TcpMessage message;
       int received = tcp_receive(&s.clients[i].peer, &message);
@@ -303,6 +356,11 @@ int run_tcp_server(const struct sockaddr_in *address, const Parameters *paramete
       break;
   }
   print_log("Сервер: завершение — %s (код %d).\n", reason, result);
+  if (s.observer.fd >= 0)
+  {
+    tcp_send(s.observer.fd, TCP_STOP, 0, result, 0, 0);
+    close(s.observer.fd);
+  }
   for (int i = 0; i < parameters->count; i++)
   {
     Client *c = &s.clients[i];

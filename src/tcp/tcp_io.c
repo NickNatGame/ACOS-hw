@@ -100,8 +100,11 @@ int tcp_receive(TcpPeer *peer, TcpMessage *message)
   peer->used = 0;
   *message = (TcpMessage){words[0], words[1], words[2], words[3], words[4], words[5]};
   
-  if (message->version != 1 || message->type < TCP_JOIN || message->type > TCP_STOP ||
-      message->id < 1 || message->id > MAX_PHILOSOPHERS || message->value > INT_MAX ||
+  int zero_id_allowed = message->type == TCP_OBSERVER_JOIN ||
+                        message->type == TCP_CONFIG || message->type == TCP_STOP;
+  if (message->version != 1 || message->type < TCP_JOIN || message->type > TCP_SNAPSHOT ||
+      (message->id < 1 && !(message->id == 0 && zero_id_allowed)) ||
+      message->id > MAX_PHILOSOPHERS || message->value > INT_MAX ||
       message->count > MAX_PHILOSOPHERS || message->cycles > INT_MAX)
     return -1;
   return 1;

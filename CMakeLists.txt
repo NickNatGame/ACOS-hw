@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-foreach(role server client)
+foreach(role server client observer)
     add_executable(philosophers_tcp_${role} src/tcp/tcp_main.c src/tcp/tcp_${role}.c
         src/tcp/tcp_io.c src/common/console.c)
     target_include_directories(philosophers_tcp_${role} PRIVATE inc/common inc/tcp)
@@ -18,6 +18,7 @@ foreach(role server client)
 endforeach()
 target_sources(philosophers_tcp_server PRIVATE src/common/parameters.c)
 target_compile_definitions(philosophers_tcp_server PRIVATE TCP_SERVER_MAIN)
+target_compile_definitions(philosophers_tcp_observer PRIVATE TCP_OBSERVER_MAIN)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -25,7 +26,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME philosophers_tcp_tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tcp.py
-                $<TARGET_FILE:philosophers_tcp_server> $<TARGET_FILE:philosophers_tcp_client>)
+                $<TARGET_FILE:philosophers_tcp_server> $<TARGET_FILE:philosophers_tcp_client>
+                $<TARGET_FILE:philosophers_tcp_observer>)
         set_tests_properties(philosophers_tcp_tests PROPERTIES TIMEOUT 60)
     endif()
 endif()

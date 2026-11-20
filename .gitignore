@@ -1,6 +1,7 @@
 .vscode/
 /bin/
 /build/
+/tests/logs/
 *.log
 __pycache__/
 style/

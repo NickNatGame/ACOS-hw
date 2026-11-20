@@ -106,6 +106,9 @@ int tcp_receive(TcpPeer *peer, TcpMessage *message)
       (message->id < 1 && !(message->id == 0 && zero_id_allowed)) ||
       message->id > MAX_PHILOSOPHERS || message->value > INT_MAX ||
       message->count > MAX_PHILOSOPHERS || message->cycles > INT_MAX)
+  {
+    errno = EPROTO;
     return -1;
+  }
   return 1;
 }

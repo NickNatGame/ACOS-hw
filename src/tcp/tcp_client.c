@@ -70,19 +70,20 @@ int run_tcp_client(const struct sockaddr_in *address, int id) {
   if (tcp_send(peer.fd, TCP_JOIN, id, 0, 0, 0) < 0) goto cleanup;
 
   TcpMessage m;
-  if (wait_message(&peer, &m, 12000) != 1 || m.id != (unsigned)id) goto cleanup;
+  if (wait_message(&peer, &m, 65000) != 1 || m.id != (unsigned)id) goto cleanup;
   if (m.type == TCP_STOP) { result = stop_code(&m, completed, cycles); goto cleanup; }
-  if (m.type != TCP_CONFIG || m.value || m.count < 2 || m.count < (unsigned)id || !m.cycles)
+  if (m.type != TCP_CONFIG || m.value > m.cycles || m.count < 2 || m.count < (unsigned)id || !m.cycles)
     goto cleanup;
   
   count = (int)m.count;
   cycles = (int)m.cycles;
+  completed = (int)m.value;
   print_log("Философ %d: подключён, участников %d, циклов %d.\n", id, count, cycles);
   int expected = TCP_START;
   while (1) {
     int timeout = -1;
-    if (expected == TCP_START)
-      timeout = 12000;
+    if (expected == TCP_START && completed < cycles)
+      timeout = 65000;
 
     if (wait_message(&peer, &m, timeout) != 1 ||
         m.id != (unsigned)id || m.count || m.cycles) break;

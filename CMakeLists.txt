@@ -22,12 +22,17 @@ target_compile_definitions(philosophers_tcp_observer PRIVATE TCP_OBSERVER_MAIN)
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Python3 QUIET COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME philosophers_tcp_tests
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tcp.py
+    add_executable(philosophers_tcp_tests tests/test_tcp.c)
+    target_include_directories(philosophers_tcp_tests PRIVATE inc/common)
+    target_compile_definitions(philosophers_tcp_tests PRIVATE _POSIX_C_SOURCE=200809L
+        TEST_LOG_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}/tests/logs")
+    target_compile_options(philosophers_tcp_tests PRIVATE -Wall -Wextra -Wpedantic)
+    set_target_properties(philosophers_tcp_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
+    add_dependencies(philosophers_tcp_tests philosophers_tcp_server philosophers_tcp_client philosophers_tcp_observer)
+    add_test(NAME philosophers_tcp_tests
+            COMMAND philosophers_tcp_tests
                 $<TARGET_FILE:philosophers_tcp_server> $<TARGET_FILE:philosophers_tcp_client>
                 $<TARGET_FILE:philosophers_tcp_observer>)
-        set_tests_properties(philosophers_tcp_tests PROPERTIES TIMEOUT 60)
-    endif()
+    set_tests_properties(philosophers_tcp_tests PROPERTIES TIMEOUT 90)
 endif()

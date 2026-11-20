@@ -14,7 +14,7 @@ int main(int argc, char **argv)
 #ifdef TCP_SERVER_MAIN
     dprintf(1, "Использование: %s IPv4 PORT [N cycles think_min think_max eat_min eat_max "
                "max_wait display_delay seed fifo time_limit]\n"
-               "На подключение всех N философов даётся 10 секунд.\n"
+               "На подключение всех N философов даётся 60 секунд.\n"
                "display_delay сохранён для совместимости; общих снимков в TCP-версии нет.\n",
             argv[0]);
 #elif defined(TCP_OBSERVER_MAIN)

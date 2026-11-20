@@ -37,7 +37,7 @@ static int connect_to_server(int fd, const struct sockaddr_in *address)
 
 static void print_snapshot(const int *states, const int *forks, int count)
 {
-  const char *names[] = {"ожидает", "готов", "думает", "голоден", "ест", "завершил"};
+  const char *names[] = {"отключён/ожидает", "готов", "думает", "голоден", "ест", "завершил", "остановлен"};
   print_log("Наблюдатель: ");
   for (int i = 0; i < count; i++) print_log("P%d=%s ", i + 1, names[states[i]]);
   print_log("| вилки: ");
@@ -73,7 +73,8 @@ int run_tcp_observer(const struct sockaddr_in *address)
       continue;
     }
     if (message.type != TCP_SNAPSHOT || !count || message.id > (unsigned)count ||
-        message.value > 5 || message.count > (unsigned)count || message.cycles > (unsigned)count) break;
+        message.value > 6 || message.count > (unsigned)count || message.cycles > (unsigned)count ||
+        message.id != (unsigned)received + 1) break;
     int index = (int)message.id - 1;
     states[index] = (int)message.value;
     forks[index] = (int)message.count;

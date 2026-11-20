@@ -1,0 +1,23 @@
+#ifndef PHILOSOPHERS_H
+#define PHILOSOPHERS_H
+
+/* Ограничиваем число участников до запуска сервера */
+#define MAX_PHILOSOPHERS 256
+
+typedef struct {
+    int count;
+    int cycles;
+    int think_min;
+    int think_max;
+    int eat_min;
+    int eat_max;
+    int max_wait;
+    int display_delay;
+    int seed;
+    int time_limit;  /* 0 отключает общий лимит времени */
+} Parameters;
+
+/* 1 - параметры прочитаны, 0 - справка, -1 - ошибка */
+int read_parameters(int argc, char **argv, Parameters *parameters);
+
+#endif
